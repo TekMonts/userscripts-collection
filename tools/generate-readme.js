@@ -5,16 +5,16 @@ const SCRIPTS_DIR = path.join(__dirname, "../scripts");
 const README_PATH = path.join(__dirname, "../README.md");
 
 function parseMeta(content) {
-  const meta = {};
-  const lines = content.split("\n");
+  const get = (key) => {
+    const match = content.match(new RegExp(`^//\\s*@${key}\\s+(.+)$`, "m"));
+    return match ? match[1].trim() : "";
+  };
 
-  for (const line of lines) {
-    if (line.includes("@name")) meta.name = line.split("@name")[1].trim();
-    if (line.includes("@description")) meta.description = line.split("@description")[1].trim();
-    if (line.includes("@version")) meta.version = line.split("@version")[1].trim();
-  }
-
-  return meta;
+  return {
+    name: get("name"),
+    description: get("description"),
+    version: get("version"),
+  };
 }
 
 function generateTable(scripts) {
