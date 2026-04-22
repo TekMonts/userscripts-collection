@@ -29,9 +29,8 @@ Intercept and log all network requests made via `XMLHttpRequest` and `fetch`.
 * Works at `document-start`
 
 **Install:**
-
-[👉 Install Script](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js)
-
+<!-- SCRIPTS_TABLE_START -->
+<!-- SCRIPTS_TABLE_END -->
 *(More scripts coming soon…)*
 
 ---
