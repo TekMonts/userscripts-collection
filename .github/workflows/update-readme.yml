@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - "scripts/*.user.js"
+      
+permissions:
+  contents: write
 
 jobs:
   update:
