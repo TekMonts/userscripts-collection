@@ -30,11 +30,7 @@ Intercept and log all network requests made via `XMLHttpRequest` and `fetch`.
 
 **Install:**
 
-```
-https://raw.githubusercontent.com/TekMonts/userscripts-collection/refs/heads/main/scripts/XHR-Fetch-Logger-Pro.user.js
-```
-
----
+[👉 Install Script](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js)
 
 *(More scripts coming soon…)*
 
