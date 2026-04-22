@@ -35,7 +35,7 @@ Intercept and log all network requests made via `XMLHttpRequest` and `fetch`.
 
 | Script | Description | Version | Install |
 |--------|------------|--------|--------|
-| space    http://tampermonkey.net/ | Log all XHR & Fetch requests. CSP-proof via unsafeWindow direct hook. Firefox + Chrome. | 1.0.0 | [Install](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js) |
+| XHR/Fetch Logger Pro | Log all XHR & Fetch requests. CSP-proof via unsafeWindow direct hook. Firefox + Chrome. | 1.0.0 | [Install](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js) |
 
 <!-- SCRIPTS_TABLE_END -->
 *(More scripts coming soon…)*
