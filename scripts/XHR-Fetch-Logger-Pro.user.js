@@ -2,7 +2,7 @@
 // @name         XHR/Fetch Logger Pro
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
-// @description  Log all XHR & Fetch requests. CSP-proof via unsafeWindow direct hook. Firefox + Chrome
+// @description  Log all XHR & Fetch requests. CSP-proof via unsafeWindow direct hook. Firefox + Chrome.
 // @author       TekMonts
 // @match        *://*/*
 // @grant        unsafeWindow
