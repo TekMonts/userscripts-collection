@@ -1,0 +1,29 @@
+name: Update README
+
+on:
+  push:
+    paths:
+      - "scripts/*.user.js"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Generate README
+        run: node tools/generate-readme.js
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add README.md
+          git commit -m "auto: update scripts table" || echo "No changes"
+          git push
