@@ -1,13 +1,15 @@
 // ==UserScript==
-// @name         XHR/Fetch Logger Pro
+// @name         XHR/Fetch/WS Logger Pro
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Log all XHR & Fetch requests. CSP-proof via unsafeWindow direct hook. Firefox + Chrome. 
+// @version      2.0.0
+// @description  XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. CSP-proof. Firefox + Chrome.
 // @author       TekMonts
 // @match        *://*/*
 // @grant        unsafeWindow
 // @grant        GM_setClipboard
 // @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
@@ -16,26 +18,55 @@
     'use strict';
 
     /* =========================================================
-     * CORE: Hook direct unsafeWindow (page's real window).
-     * Not using <script> tag → CSP cannot block.
+     * ⚙ CONFIG + STATE
      * ========================================================= */
+    const CONFIG = {
+        MAX_LOGS: 2000,
+        MAX_BODY_BYTES: 200000,
+        RENDER_CAP: 400,
+        WS_MAX_FRAMES: 500,
+        WS_FRAME_BYTES: 20000,
+        AUTO_CLEAR_MS: 0,     // 0 = off
+    };
 
+    const state = {
+        store: [],
+        paused: false,
+        skipBody: false,
+        groupByDomain: true,
+        selectedId: null,
+        baselineId: null,
+        filter: '',
+        hookOK: false,
+        hookMethod: 'pending',
+        hookError: null,
+        autoClearTimer: null,
+        autoClearNext: 0,
+        hookActivatedAt: 0,
+        panelPos: null,   // {left, top}
+        panelSize: null,  // {width, height}
+    };
+
+    // Load persisted UI state
+    try {
+        state.panelPos = JSON.parse(GM_getValue('panelPos', 'null'));
+        state.panelSize = JSON.parse(GM_getValue('panelSize', 'null'));
+    } catch (_) {}
+
+    /* =========================================================
+     * 🧩 ENV DETECTION
+     * ========================================================= */
     const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const isFirefox = (typeof exportFunction === 'function') && (typeof cloneInto === 'function');
-
-    // Wrap function allowing page world calls (Firefox xray) or plain (Chrome)
     const exportFn = (fn) => isFirefox ? exportFunction(fn, W) : fn;
-    const cloneObj = (obj) => isFirefox ? cloneInto(obj, W, { cloneFunctions: true }) : obj;
 
-    const store = [];
-    let hookOK = false;
-    let hookMethod = 'pending';
-    let hookError = null;
-
+    /* =========================================================
+     * 🛠 UTILITIES
+     * ========================================================= */
     const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
     const truncate = (s, max) => {
-        max = max || 500000;
+        max = max || CONFIG.MAX_BODY_BYTES;
         if (typeof s !== 'string') return s;
         return s.length > max ? s.slice(0, max) + '\n…[truncated ' + (s.length - max) + ' chars]' : s;
     };
@@ -52,14 +83,151 @@
         return h;
     };
 
+    // Decode binary buffer: try UTF-8 text first, fallback to hex preview
+    const decodeBinary = (buf) => {
+        try {
+            let view;
+            if (buf instanceof ArrayBuffer) view = new Uint8Array(buf);
+            else if (ArrayBuffer.isView(buf)) view = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+            else return '[binary unknown]';
+
+            const len = view.byteLength;
+            const typeName = (buf.constructor && buf.constructor.name) || 'binary';
+
+            // Try UTF-8 decode + printability check
+            try {
+                const text = new TextDecoder('utf-8', { fatal: false }).decode(view);
+                let nonPrintable = 0;
+                const sampleLen = Math.min(text.length, 1024);
+                for (let i = 0; i < sampleLen; i++) {
+                    const c = text.charCodeAt(i);
+                    if ((c < 0x20 && c !== 0x09 && c !== 0x0A && c !== 0x0D) || c === 0xFFFD) nonPrintable++;
+                }
+                if (nonPrintable / Math.max(sampleLen, 1) < 0.05) {
+                    return truncate(text);
+                }
+            } catch (_) {}
+
+            // Hex preview fallback
+            const hexLen = Math.min(64, len);
+            const hex = Array.from(view.slice(0, hexLen))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+            return `[${typeName} ${len}B] hex: ${hex}${len > hexLen ? '…' : ''}`;
+        } catch (_) {
+            return '[binary unreadable]';
+        }
+    };
+
+    // Serialize FormData to preview string
+    const serializeFormData = (fd) => {
+        try {
+            const parts = [];
+            let count = 0;
+            for (const [k, v] of fd.entries()) {
+                if (count++ > 50) { parts.push('…[+more]'); break; }
+                if (typeof v === 'string') parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+                else if (v && v.name != null) parts.push(`${k}=[File ${v.name} ${v.size}B ${v.type || ''}]`);
+                else parts.push(k + '=[?]');
+            }
+            return '[FormData] ' + truncate(parts.join('&'));
+        } catch (_) { return '[FormData]'; }
+    };
+
+    // Universal body encoder — text-first, binary-safe
+    const encodeBody = (body) => {
+        if (body == null) return null;
+        if (typeof body === 'string') return truncate(body);
+        if (!body.constructor) return '[unknown]';
+        const n = body.constructor.name;
+        if (n === 'FormData') return serializeFormData(body);
+        if (n === 'Blob') return `[Blob ${body.size}B type=${body.type || '?'}]`;
+        if (n === 'URLSearchParams') return truncate(String(body));
+        if (n === 'ArrayBuffer' || ArrayBuffer.isView(body)) return decodeBinary(body);
+        if (n === 'ReadableStream') return '[ReadableStream]';
+        if (n === 'Document') return truncate(new XMLSerializer().serializeToString(body));
+        return '[' + n + ']';
+    };
+
+    const hostnameOf = (url) => {
+        try { return new URL(url, location.href).hostname; }
+        catch (_) { return url && url.startsWith && url.startsWith('ws') ? 'ws' : '(local)'; }
+    };
+
+    /* =========================================================
+     * 🔐 SENSITIVE DETECTION
+     * ========================================================= */
+    const SENSITIVE_HEADERS = /^(authorization|cookie|set-cookie|x-auth|x-auth-token|x-api-key|x-csrf-token|x-xsrf-token|api-key|bearer|proxy-authorization|www-authenticate)$/i;
+    const SENSITIVE_BODY_KEY = /\b(password|passwd|pwd|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|jwt|bearer|ssn|credit[_-]?card|cvv|private[_-]?key)\b/i;
+
+    const flagSensitive = (log) => {
+        const flags = [];
+        const scanHeaders = (obj, where) => {
+            if (!obj) return;
+            for (const k of Object.keys(obj)) {
+                if (SENSITIVE_HEADERS.test(k)) flags.push(where + ':' + k.toLowerCase());
+            }
+        };
+        scanHeaders(log.requestHeaders, 'req');
+        scanHeaders(log.responseHeaders, 'res');
+
+        const bodyMix = [log.requestBody, log.responseBody].filter(v => typeof v === 'string').join(' ');
+        if (bodyMix && SENSITIVE_BODY_KEY.test(bodyMix)) flags.push('body');
+
+        log.sensitive = flags.length > 0;
+        log.sensitiveFlags = flags;
+    };
+
+    /* =========================================================
+     * 📥 LOG PIPELINE
+     * ========================================================= */
     const pushLog = (log) => {
-        store.push(log);
+        if (state.paused) return;
+
+        // Normalize URL → absolute (so cURL/replay/export always have hostname)
+        try {
+            if (log.url && !/^(https?|wss?|data|blob|file):/i.test(log.url)) {
+                log.url = new URL(log.url, location.href).href;
+            }
+        } catch (_) {}
+
+        log.hostname = hostnameOf(log.url);
+
+        if (state.skipBody) {
+            log.requestBody = log.requestBody ? '[skipped]' : null;
+            log.responseBody = '[skipped]';
+        }
+
+        flagSensitive(log);
+
+        state.store.push(log);
+
+        // Hard cap: drop oldest (but protect selected)
+        if (state.store.length > CONFIG.MAX_LOGS) {
+            const over = state.store.length - CONFIG.MAX_LOGS;
+            let dropped = 0, i = 0;
+            while (dropped < over && i < state.store.length) {
+                if (state.store[i].id !== state.selectedId && state.store[i].id !== state.baselineId) {
+                    state.store.splice(i, 1);
+                    dropped++;
+                } else {
+                    i++;
+                }
+            }
+        }
+
+        scheduleRender();
+    };
+
+    const updateLog = (log) => {   // for WS frame updates without re-push
         scheduleRender();
     };
 
     /* =========================================================
-     * HOOK XMLHttpRequest
+     * 🪝 XHR HOOK
      * ========================================================= */
+    const xhrLogMap = new WeakMap();
+
     const installXHRHook = () => {
         const OrigXHR = W.XMLHttpRequest;
         if (!OrigXHR || !OrigXHR.prototype) throw new Error('No XHR in unsafeWindow');
@@ -71,15 +239,14 @@
 
         const newOpen = exportFn(function (method, url) {
             try {
-                const log = {
+                xhrLogMap.set(this, {
                     id: uid(), type: 'xhr',
                     method: (method || 'GET').toUpperCase(),
                     url: String(url), requestHeaders: {},
                     time: new Date().toISOString(),
                     startedAt: Date.now()
-                };
-                xhrLogMap.set(this, log);
-            } catch (e) {}
+                });
+            } catch (_) {}
             return origOpen.apply(this, arguments);
         });
 
@@ -87,7 +254,7 @@
             try {
                 const log = xhrLogMap.get(this);
                 if (log) log.requestHeaders[k] = String(v);
-            } catch (e) {}
+            } catch (_) {}
             return origSetHeader.apply(this, arguments);
         });
 
@@ -95,13 +262,7 @@
             try {
                 const log = xhrLogMap.get(this);
                 if (log) {
-                    try {
-                        if (body == null) log.requestBody = null;
-                        else if (typeof body === 'string') log.requestBody = truncate(body);
-                        else if (body && body.constructor && body.constructor.name === 'FormData') log.requestBody = '[FormData]';
-                        else if (body && body.constructor && body.constructor.name === 'Blob') log.requestBody = '[Blob]';
-                        else log.requestBody = '[binary]';
-                    } catch (_) { log.requestBody = '[unreadable]'; }
+                    log.requestBody = encodeBody(body);
 
                     const xhr = this;
                     xhr.addEventListener('loadend', exportFn(function () {
@@ -111,40 +272,36 @@
                             log.duration = Date.now() - log.startedAt;
                             try { log.responseHeaders = parseHeaders(xhr.getAllResponseHeaders()); } catch (_) { log.responseHeaders = {}; }
                             try {
-                                if (xhr.responseType === '' || xhr.responseType === 'text') log.responseBody = truncate(xhr.responseText || '');
-                                else if (xhr.responseType === 'json') log.responseBody = truncate(JSON.stringify(xhr.response));
-                                else log.responseBody = '[' + (xhr.responseType || 'binary') + ']';
+                                if (xhr.responseType === '' || xhr.responseType === 'text') {
+                                    log.responseBody = truncate(xhr.responseText || '');
+                                } else if (xhr.responseType === 'json') {
+                                    log.responseBody = truncate(JSON.stringify(xhr.response));
+                                } else {
+                                    log.responseBody = '[' + (xhr.responseType || 'binary') + ']';
+                                }
                             } catch (_) { log.responseBody = '[unreadable]'; }
                             pushLog(log);
-                        } catch (e) {}
+                        } catch (_) {}
                     }));
                 }
-            } catch (e) {}
+            } catch (_) {}
             return origSend.apply(this, arguments);
         });
 
-        let assigned = false;
         try {
             proto.open = newOpen;
             proto.setRequestHeader = newSetHeader;
             proto.send = newSend;
-            assigned = (proto.open !== origOpen);
-        } catch (_) {}
-
-        if (!assigned) {
-            // Fallback: defineProperty
+        } catch (_) {
             Object.defineProperty(proto, 'open', { value: newOpen, writable: true, configurable: true });
             Object.defineProperty(proto, 'setRequestHeader', { value: newSetHeader, writable: true, configurable: true });
             Object.defineProperty(proto, 'send', { value: newSend, writable: true, configurable: true });
         }
-
         return true;
     };
 
-    const xhrLogMap = new WeakMap();
-
     /* =========================================================
-     * HOOK fetch
+     * 🪝 FETCH HOOK (async/await safe - returns original promise)
      * ========================================================= */
     const installFetchHook = () => {
         const origFetch = W.fetch;
@@ -157,10 +314,13 @@
                 startedAt: Date.now(),
                 requestHeaders: {}
             };
+
             try {
-                log.url = (typeof input === 'string') ? input : (input && input.url) || String(input);
-                log.method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-                const hdrs = (init && init.headers) || (input && input.headers);
+                const isReq = (typeof Request !== 'undefined') && (input instanceof Request);
+                log.url = isReq ? input.url : String(input);
+                log.method = ((init && init.method) || (isReq && input.method) || 'GET').toUpperCase();
+
+                const hdrs = (init && init.headers) || (isReq && input.headers);
                 if (hdrs) {
                     if (typeof hdrs.forEach === 'function') {
                         hdrs.forEach(exportFn(function (v, k) { log.requestHeaders[k] = String(v); }));
@@ -168,37 +328,38 @@
                         try { Object.keys(hdrs).forEach(k => log.requestHeaders[k] = String(hdrs[k])); } catch (_) {}
                     }
                 }
+
                 if (init && init.body != null) {
-                    if (typeof init.body === 'string') log.requestBody = truncate(init.body);
-                    else log.requestBody = '[non-text]';
+                    log.requestBody = encodeBody(init.body);
                 }
             } catch (_) {}
 
             const promise = origFetch.apply(this, arguments);
-            try {
-                promise.then(exportFn(function (res) {
-                    try {
-                        const clone = res.clone();
-                        log.status = clone.status;
-                        log.statusText = clone.statusText;
-                        log.duration = Date.now() - log.startedAt;
-                        log.responseHeaders = {};
-                        clone.headers.forEach(exportFn(function (v, k) { log.responseHeaders[k] = v; }));
-                        clone.text().then(exportFn(function (t) {
-                            log.responseBody = truncate(t);
-                            pushLog(log);
-                        }), exportFn(function () {
-                            log.responseBody = '[unreadable]';
-                            pushLog(log);
-                        }));
-                    } catch (_) { pushLog(log); }
-                }), exportFn(function (err) {
-                    log.status = 0;
-                    log.error = String(err);
+
+            // Tap without breaking async/await chain
+            promise.then(exportFn(function (res) {
+                try {
+                    const clone = res.clone();
+                    log.status = clone.status;
+                    log.statusText = clone.statusText;
                     log.duration = Date.now() - log.startedAt;
-                    pushLog(log);
-                }));
-            } catch (_) {}
+                    log.responseHeaders = {};
+                    clone.headers.forEach(exportFn(function (v, k) { log.responseHeaders[k] = v; }));
+                    clone.text().then(exportFn(function (t) {
+                        log.responseBody = truncate(t);
+                        pushLog(log);
+                    }), exportFn(function () {
+                        log.responseBody = '[unreadable]';
+                        pushLog(log);
+                    }));
+                } catch (_) { pushLog(log); }
+            }), exportFn(function (err) {
+                log.status = 0;
+                log.error = String(err);
+                log.duration = Date.now() - log.startedAt;
+                pushLog(log);
+            }));
+
             return promise;
         });
 
@@ -211,84 +372,319 @@
     };
 
     /* =========================================================
-     * INSTALL HOOKS
+     * 🪝 WEBSOCKET HOOK (both directions)
      * ========================================================= */
-    try {
-        installXHRHook();
-        installFetchHook();
-        hookOK = true;
-        hookMethod = isFirefox ? 'unsafeWindow+exportFunction (Firefox)' : 'unsafeWindow direct (Chrome)';
-        console.log('[XHR Logger] Hook installed:', hookMethod);
-    } catch (e) {
-        hookError = String(e);
-        console.error('[XHR Logger] Hook install failed:', e);
+    const wsLogMap = new WeakMap();
 
-        // Fallback
-        try {
-            const src = '(' + function (TAG) {
-                if (window.__XHR_LOGGER_FB__) return;
-                window.__XHR_LOGGER_FB__ = true;
-                const post = (p) => window.postMessage({ __tag: TAG, payload: p }, '*');
-                const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-                const OrigXHR = window.XMLHttpRequest;
-                const po = OrigXHR.prototype.open, ps = OrigXHR.prototype.send;
-                OrigXHR.prototype.open = function (m, u) {
-                    this.__l = { id: uid(), type: 'xhr', method: (m || 'GET').toUpperCase(), url: String(u), requestHeaders: {}, time: new Date().toISOString(), startedAt: Date.now() };
-                    return po.apply(this, arguments);
-                };
-                OrigXHR.prototype.send = function (b) {
-                    const l = this.__l;
-                    if (l) {
-                        l.requestBody = typeof b === 'string' ? b : (b ? '[binary]' : null);
-                        const x = this;
-                        x.addEventListener('loadend', function () {
-                            l.status = x.status; l.duration = Date.now() - l.startedAt;
-                            try { l.responseBody = x.responseText || ''; } catch (_) {}
-                            post({ kind: 'log', data: l });
-                        });
-                    }
-                    return ps.apply(this, arguments);
-                };
-                if (window.fetch) {
-                    const of = window.fetch;
-                    window.fetch = function (i, n) {
-                        const l = { id: uid(), type: 'fetch', url: typeof i === 'string' ? i : (i && i.url), method: ((n && n.method) || 'GET').toUpperCase(), requestHeaders: {}, time: new Date().toISOString(), startedAt: Date.now() };
-                        if (n && typeof n.body === 'string') l.requestBody = n.body;
-                        return of.apply(this, arguments).then(r => {
-                            const c = r.clone();
-                            l.status = c.status; l.duration = Date.now() - l.startedAt;
-                            l.responseHeaders = {};
-                            c.headers.forEach((v, k) => l.responseHeaders[k] = v);
-                            c.text().then(t => { l.responseBody = t; post({ kind: 'log', data: l }); });
-                            return r;
-                        });
-                    };
+    const installWSHook = () => {
+        const OrigWS = W.WebSocket;
+        if (!OrigWS) return false;
+
+        // Hook send on prototype → catches outgoing frames
+        const proto = OrigWS.prototype;
+        const origSend = proto.send;
+
+        const newSend = exportFn(function (data) {
+            try {
+                let log = wsLogMap.get(this);
+                if (!log) {
+                    log = createWSLog(this.url || '(unknown)');
+                    wsLogMap.set(this, log);
+                    state.store.push(log);
                 }
-                post({ kind: 'ready' });
-            }.toString() + ')("__XHR_LOGGER_MSG__");';
+                pushWSFrame(log, 'out', data);
+                scheduleRender();
+            } catch (_) {}
+            return origSend.apply(this, arguments);
+        });
 
-            const s = document.createElement('script');
-            s.textContent = src;
-            (document.head || document.documentElement).appendChild(s);
-            s.remove();
+        try { proto.send = newSend; }
+        catch (_) { Object.defineProperty(proto, 'send', { value: newSend, writable: true, configurable: true }); }
 
-            window.addEventListener('message', (e) => {
-                if (e.source !== window || !e.data || e.data.__tag !== '__XHR_LOGGER_MSG__') return;
-                if (e.data.payload.kind === 'log') pushLog(e.data.payload.data);
-                else if (e.data.payload.kind === 'ready') { hookOK = true; hookMethod = 'script-tag fallback'; scheduleRender(); }
-            });
-            hookMethod = 'script-tag (fallback pending)';
-        } catch (e2) {
-            hookError += ' | fallback: ' + e2;
+        // Wrap constructor → attach message listener to catch incoming
+        function HookedWS(url, protocols) {
+            const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+
+            let log = createWSLog(String(url));
+            wsLogMap.set(ws, log);
+            state.store.push(log);
+            flagSensitive(log);
+            scheduleRender();
+
+            ws.addEventListener('open', exportFn(function () {
+                log.status = 101;
+                log.statusText = 'Switching Protocols';
+                scheduleRender();
+            }));
+
+            ws.addEventListener('message', exportFn(function (e) {
+                try { pushWSFrame(log, 'in', e.data); scheduleRender(); } catch (_) {}
+            }));
+
+            ws.addEventListener('close', exportFn(function (e) {
+                log.closed = true;
+                log.closeCode = e.code;
+                log.closeReason = e.reason;
+                log.duration = Date.now() - log.startedAt;
+                scheduleRender();
+            }));
+
+            ws.addEventListener('error', exportFn(function () {
+                log.error = 'WebSocket error';
+                scheduleRender();
+            }));
+
+            return ws;
         }
-    }
+
+        // Preserve prototype chain so `instanceof WebSocket` works
+        HookedWS.prototype = OrigWS.prototype;
+        try {
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => {
+                if (k in OrigWS) HookedWS[k] = OrigWS[k];
+            });
+        } catch (_) {}
+
+        const wrappedCtor = isFirefox ? exportFn(HookedWS) : HookedWS;
+        // Re-apply prototype after exportFn (on the page-side function)
+        try { wrappedCtor.prototype = OrigWS.prototype; } catch (_) {}
+        try {
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => {
+                if (k in OrigWS) wrappedCtor[k] = OrigWS[k];
+            });
+        } catch (_) {}
+
+        try { W.WebSocket = wrappedCtor; }
+        catch (_) { Object.defineProperty(W, 'WebSocket', { value: wrappedCtor, writable: true, configurable: true }); }
+
+        return true;
+    };
+
+    const createWSLog = (url) => ({
+        id: uid(), type: 'ws',
+        method: 'WS',
+        url: String(url),
+        requestHeaders: {}, responseHeaders: {},
+        time: new Date().toISOString(),
+        startedAt: Date.now(),
+        frames: []
+    });
+
+    const pushWSFrame = (log, dir, data) => {
+        if (state.paused) return;
+        if (log.frames.length >= CONFIG.WS_MAX_FRAMES) log.frames.shift();
+        let preview;
+        try {
+            if (data == null) preview = '';
+            else if (typeof data === 'string') preview = truncate(data, CONFIG.WS_FRAME_BYTES);
+            else if (data.byteLength != null) preview = '[binary ' + data.byteLength + 'B]';
+            else preview = String(data);
+        } catch (_) { preview = '[unreadable]'; }
+        log.frames.push({ dir, time: Date.now(), data: preview });
+    };
 
     /* =========================================================
-     * UI
+     * 🎬 INSTALL ALL HOOKS
+     * ========================================================= */
+    (function installAll() {
+        try {
+            installXHRHook();
+            installFetchHook();
+            installWSHook();
+            state.hookOK = true;
+            state.hookActivatedAt = Date.now();
+            state.hookMethod = isFirefox ? 'unsafeWindow+exportFunction (FF)' : 'unsafeWindow direct';
+            console.log('[XHR Logger] Hooks installed via', state.hookMethod);
+        } catch (e) {
+            state.hookError = String(e);
+            console.error('[XHR Logger] Hook install failed:', e);
+        }
+    })();
+
+    /* =========================================================
+     * 👁 SAFETY NET: PerformanceObserver catches requests that
+     *    fired BEFORE hooks installed (early page-load race).
+     * ========================================================= */
+    (function installPerformanceObserver() {
+        if (typeof PerformanceObserver === 'undefined') return;
+        try {
+            const po = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    // Only interested in XHR/fetch
+                    if (entry.initiatorType !== 'fetch' && entry.initiatorType !== 'xmlhttprequest') continue;
+
+                    const absTime = performance.timeOrigin + entry.startTime;
+
+                    // Skip anything that happened AFTER hook was active — hook should have it
+                    if (state.hookActivatedAt && absTime >= state.hookActivatedAt - 50) continue;
+
+                    // Normalize URL
+                    let url;
+                    try { url = new URL(entry.name, location.href).href; } catch (_) { url = entry.name; }
+
+                    // Dedup against existing logs (in case hook got it anyway)
+                    const dup = state.store.some(l =>
+                        l.url === url && Math.abs(l.startedAt - absTime) < 200
+                    );
+                    if (dup) continue;
+
+                    const log = {
+                        id: uid(),
+                        type: entry.initiatorType === 'fetch' ? 'fetch' : 'xhr',
+                        method: '?',
+                        url,
+                        requestHeaders: {},
+                        responseHeaders: {},
+                        requestBody: null,
+                        responseBody: '[captured via PerformanceObserver — fired before hook installed. Headers/body unavailable. Reload page if you need full capture.]',
+                        time: new Date(absTime).toISOString(),
+                        startedAt: absTime,
+                        duration: Math.round(entry.duration || 0),
+                        status: entry.responseStatus || 0,
+                        statusText: '',
+                        _observed: true
+                    };
+                    pushLog(log);
+                }
+            });
+            po.observe({ type: 'resource', buffered: true });
+            console.log('[XHR Logger] PerformanceObserver active (safety net for early requests)');
+        } catch (e) {
+            console.warn('[XHR Logger] PerformanceObserver setup failed:', e);
+        }
+    })();
+
+    /* =========================================================
+     * 🔁 REPLAY ENGINE
+     * ========================================================= */
+    const replay = (log) => {
+        if (!log) throw new Error('replay: no log given');
+        if (log.type === 'ws') throw new Error('replay: WebSocket replay not supported (use native new WebSocket)');
+
+        const headers = {};
+        // Filter forbidden headers (browser controls these)
+        const FORBIDDEN = /^(host|content-length|connection|accept-encoding|cookie|origin|referer|user-agent|sec-|proxy-|transfer-encoding|te|upgrade|keep-alive|expect|trailer)/i;
+        for (const [k, v] of Object.entries(log.requestHeaders || {})) {
+            if (!FORBIDDEN.test(k)) headers[k] = v;
+        }
+
+        const opts = {
+            method: log.method,
+            headers,
+            credentials: 'include',
+            mode: 'cors',
+        };
+        if (!['GET', 'HEAD'].includes(log.method) && log.requestBody && typeof log.requestBody === 'string' && !log.requestBody.startsWith('[')) {
+            opts.body = log.requestBody;
+        }
+
+        console.log('[XHR Logger] Replaying:', log.method, log.url);
+        return fetch(log.url, opts).then(async res => {
+            const text = await res.text();
+            const replayed = {
+                status: res.status,
+                statusText: res.statusText,
+                headers: Object.fromEntries(res.headers.entries()),
+                body: text
+            };
+            console.log('[XHR Logger] Replay result:', replayed);
+            return replayed;
+        });
+    };
+
+    /* =========================================================
+     * 🔬 DIFF ENGINE
+     * ========================================================= */
+    const safeParse = (s) => {
+        if (typeof s !== 'string') return s;
+        try { return JSON.parse(s); } catch (_) { return s; }
+    };
+
+    const diffValues = (a, b, path, acc) => {
+        if (a === b) return;
+        if (typeof a !== typeof b) { acc.push({ path, type: 'type', from: a, to: b }); return; }
+        if (a === null || b === null || typeof a !== 'object') {
+            acc.push({ path, type: 'value', from: a, to: b });
+            return;
+        }
+        if (Array.isArray(a) && Array.isArray(b)) {
+            const n = Math.max(a.length, b.length);
+            for (let i = 0; i < n; i++) {
+                const p = path + '[' + i + ']';
+                if (i >= a.length) acc.push({ path: p, type: 'added', to: b[i] });
+                else if (i >= b.length) acc.push({ path: p, type: 'removed', from: a[i] });
+                else diffValues(a[i], b[i], p, acc);
+            }
+            return;
+        }
+        const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+        for (const k of keys) {
+            const p = path ? path + '.' + k : k;
+            if (!(k in a)) acc.push({ path: p, type: 'added', to: b[k] });
+            else if (!(k in b)) acc.push({ path: p, type: 'removed', from: a[k] });
+            else diffValues(a[k], b[k], p, acc);
+        }
+    };
+
+    const diff = (a, b) => {
+        if (typeof a === 'string') a = state.store.find(l => l.id === a);
+        if (typeof b === 'string') b = state.store.find(l => l.id === b);
+        if (!a || !b) throw new Error('diff: log(s) not found');
+        const acc = [];
+        diffValues(safeParse(a.responseBody), safeParse(b.responseBody), '', acc);
+        return acc;
+    };
+
+    /* =========================================================
+     * 🎛 AUTO-CLEAR
+     * ========================================================= */
+    const setAutoClear = (ms) => {
+        CONFIG.AUTO_CLEAR_MS = ms;
+        if (state.autoClearTimer) { clearInterval(state.autoClearTimer); state.autoClearTimer = null; }
+        state.autoClearNext = 0;
+        if (ms > 0) {
+            state.autoClearNext = Date.now() + ms;
+            state.autoClearTimer = setInterval(() => {
+                // Bulk clear: wipe all EXCEPT selected + baseline
+                state.store = state.store.filter(l =>
+                    l.id === state.selectedId ||
+                    l.id === state.baselineId
+                );
+                state.autoClearNext = Date.now() + ms;
+                scheduleRender();
+            }, ms);
+        }
+    };
+
+    /* =========================================================
+     * 🌐 PUBLIC API
+     * ========================================================= */
+    const api = {
+        pause: () => { state.paused = true; updateStatusUI(); console.log('[XHR Logger] ⏸️ Paused'); },
+        resume: () => { state.paused = false; updateStatusUI(); console.log('[XHR Logger] ▶️ Resumed'); },
+        clear: () => { state.store.length = 0; state.selectedId = null; state.baselineId = null; scheduleRender(); console.log('[XHR Logger] Cleared'); },
+        logs: () => state.store.slice(),
+        replay,
+        diff,
+        setSkipBody: (v) => { state.skipBody = !!v; console.log('[XHR Logger] skipBody:', state.skipBody); },
+        setMaxLogs: (n) => { CONFIG.MAX_LOGS = n; console.log('[XHR Logger] MAX_LOGS:', n); },
+        setAutoClear,
+        config: CONFIG,
+        state: () => ({ ...state, store: undefined })
+    };
+
+    try {
+        if (isFirefox) W.__XHR_LOGGER__ = cloneInto(api, W, { cloneFunctions: true });
+        else W.__XHR_LOGGER__ = api;
+    } catch (e) { console.warn('[XHR Logger] Cannot expose global:', e); }
+    window.__XHR_LOGGER__ = api;
+
+    /* =========================================================
+     * 🎨 UI
      * ========================================================= */
     GM_addStyle(`
-        #xhr-logger-root, #xhr-logger-root * { box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; }
-        #xhr-logger-fab {
+        #xhrl-root, #xhrl-root * { box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; }
+        #xhrl-fab {
             position: fixed; z-index: 2147483646; bottom: 20px; right: 20px;
             width: 48px; height: 48px; border-radius: 50%;
             background: linear-gradient(135deg,#6366f1,#8b5cf6); color: #fff;
@@ -297,121 +693,232 @@
             font-weight: 700; font-size: 18px; user-select: none;
             transition: transform .2s;
         }
-        #xhr-logger-fab:hover { transform: scale(1.08); }
-        #xhr-logger-fab .badge {
+        #xhrl-fab:hover { transform: scale(1.08); }
+        #xhrl-fab.paused { background: linear-gradient(135deg,#ef4444,#f97316); }
+        #xhrl-fab .badge {
             position: absolute; top: -4px; right: -4px; background: #ef4444;
             color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 10px;
-            min-width: 20px; text-align: center;
+            min-width: 20px; text-align: center; font-weight: 700;
         }
-        #xhr-logger-panel {
-            position: fixed; z-index: 2147483647; bottom: 80px; right: 20px;
-            width: 750px; max-width: 95vw; height: 520px; max-height: 85vh;
+        #xhrl-panel {
+            position: fixed; z-index: 2147483647;
+            width: 850px; max-width: 95vw; height: 560px; max-height: 85vh;
             background: #0f172a; color: #e2e8f0;
             border: 1px solid #334155; border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0,0,0,.6);
             display: none; flex-direction: column; overflow: hidden;
-            resize: both;
+            min-width: 500px; min-height: 300px;
         }
-        #xhr-logger-panel.open { display: flex; }
+        #xhrl-panel.open { display: flex; }
         .xhrl-header {
-            display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+            display: flex; align-items: center; gap: 6px; padding: 8px 10px;
             background: #1e293b; border-bottom: 1px solid #334155; flex-wrap: wrap;
+            cursor: move; user-select: none;
         }
-        .xhrl-header .title { font-weight: 700; color: #a5b4fc; flex: 1; font-size: 13px; }
+        .xhrl-header .title { font-weight: 700; color: #a5b4fc; flex: 1; font-size: 12px; }
+        .xhrl-header .title .ver { color: #64748b; font-weight: 400; font-size: 10px; margin-left: 4px; }
+        .xhrl-header input, .xhrl-header button { cursor: auto; }
         .xhrl-btn {
-            background: #334155; color: #e2e8f0; border: none; padding: 5px 10px;
-            border-radius: 6px; font-size: 11px; cursor: pointer; font-family: inherit;
+            background: #334155; color: #e2e8f0; border: none; padding: 4px 8px;
+            border-radius: 5px; font-size: 11px; cursor: pointer; font-family: inherit;
+            white-space: nowrap;
         }
         .xhrl-btn:hover { background: #475569; }
+        .xhrl-btn.active { background: #6366f1; }
         .xhrl-btn.danger { background: #7f1d1d; }
         .xhrl-btn.danger:hover { background: #991b1b; }
+        .xhrl-btn.warn { background: #92400e; }
+        .xhrl-btn.warn:hover { background: #b45309; }
         .xhrl-search {
-            padding: 6px 10px; background: #0f172a; border: 1px solid #334155;
-            color: #e2e8f0; border-radius: 6px; font-size: 12px; width: 160px;
+            padding: 5px 8px; background: #0f172a; border: 1px solid #334155;
+            color: #e2e8f0; border-radius: 5px; font-size: 11px; width: 140px;
             font-family: inherit;
         }
         .xhrl-body { display: flex; flex: 1; overflow: hidden; }
-        .xhrl-list { width: 45%; overflow-y: auto; border-right: 1px solid #334155; }
+        .xhrl-list { width: 42%; overflow-y: auto; border-right: 1px solid #334155; }
+        .xhrl-group-hdr {
+            padding: 4px 10px; background: #1e293b; color: #94a3b8;
+            font-size: 10px; font-weight: 700; position: sticky; top: 0; z-index: 2;
+            border-bottom: 1px solid #0f172a;
+        }
         .xhrl-item {
-            padding: 8px 10px; border-bottom: 1px solid #1e293b; cursor: pointer;
-            font-size: 11px; display: flex; gap: 6px; align-items: center;
+            padding: 6px 10px; border-bottom: 1px solid #1e293b; cursor: pointer;
+            font-size: 11px; display: flex; gap: 5px; align-items: center;
         }
         .xhrl-item:hover { background: #1e293b; }
         .xhrl-item.active { background: #312e81; }
+        .xhrl-item.baseline { border-left: 3px solid #fbbf24; padding-left: 7px; }
         .xhrl-method {
-            padding: 1px 6px; border-radius: 3px; font-weight: 700; font-size: 10px;
-            min-width: 45px; text-align: center;
+            padding: 1px 5px; border-radius: 3px; font-weight: 700; font-size: 9px;
+            min-width: 40px; text-align: center;
         }
         .m-GET { background: #065f46; color: #6ee7b7; }
         .m-POST { background: #1e40af; color: #93c5fd; }
         .m-PUT { background: #92400e; color: #fcd34d; }
         .m-DELETE { background: #991b1b; color: #fca5a5; }
         .m-PATCH { background: #5b21b6; color: #c4b5fd; }
+        .m-WS { background: #134e4a; color: #5eead4; }
         .xhrl-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .xhrl-status { font-weight: 700; font-size: 10px; }
+        .xhrl-status { font-weight: 700; font-size: 10px; min-width: 28px; }
         .s-2 { color: #6ee7b7; } .s-3 { color: #fcd34d; }
         .s-4 { color: #fca5a5; } .s-5 { color: #f87171; } .s-0 { color: #94a3b8; }
+        .xhrl-flag { font-size: 10px; }
         .xhrl-detail {
             flex: 1; overflow-y: auto; padding: 10px; font-size: 11px;
             background: #020617;
         }
-        .xhrl-detail h4 { color: #a5b4fc; margin: 8px 0 4px; font-size: 12px; }
+        .xhrl-detail h4 { color: #a5b4fc; margin: 8px 0 4px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
         .xhrl-detail pre {
             background: #0f172a; padding: 8px; border-radius: 6px;
             overflow-x: auto; white-space: pre-wrap; word-break: break-all;
             border: 1px solid #1e293b; margin: 0; color: #cbd5e1; max-height: 300px;
         }
-        .xhrl-detail .row { display: flex; gap: 8px; margin-bottom: 4px; word-break: break-all; }
-        .xhrl-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+        .xhrl-detail .row { display: flex; gap: 6px; margin-bottom: 4px; word-break: break-all; align-items: baseline; flex-wrap: wrap; }
+        .xhrl-actions { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
         .xhrl-empty { padding: 20px; text-align: center; color: #64748b; font-size: 12px; }
         .xhrl-toast {
             position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
             background: #10b981; color: #fff; padding: 8px 16px; border-radius: 6px;
             font-size: 12px; z-index: 2147483647; font-family: ui-monospace,monospace;
         }
-        .xhrl-diag { font-size: 10px; color: #94a3b8; padding: 6px 12px; background: #0b1120; border-top: 1px solid #1e293b; }
+        .xhrl-diag { font-size: 10px; color: #94a3b8; padding: 5px 10px; background: #0b1120; border-top: 1px solid #1e293b; display: flex; justify-content: space-between; gap: 8px; }
         .xhrl-diag.err { color: #fca5a5; }
+        .xhrl-sensitive-tag { background: #7f1d1d; color: #fecaca; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 700; }
+        .xhrl-frame { padding: 4px 8px; margin: 2px 0; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; border-left: 3px solid; }
+        .xhrl-frame.in { background: #0c2e1a; border-color: #10b981; }
+        .xhrl-frame.out { background: #1e1b4b; border-color: #6366f1; }
+        .xhrl-frame .t { color: #64748b; font-size: 10px; margin-right: 6px; }
+        .xhrl-resize {
+            position: absolute; right: 0; bottom: 0; width: 14px; height: 14px;
+            cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, #475569 50%);
+        }
+        .xhrl-diff-added { color: #6ee7b7; }
+        .xhrl-diff-removed { color: #fca5a5; text-decoration: line-through; }
+        .xhrl-diff-changed { color: #fcd34d; }
     `);
 
     const fab = document.createElement('div');
-    fab.id = 'xhr-logger-fab';
+    fab.id = 'xhrl-fab';
     fab.innerHTML = '🕸<span class="badge" style="display:none">0</span>';
 
     const panel = document.createElement('div');
-    panel.id = 'xhr-logger-panel';
+    panel.id = 'xhrl-panel';
     panel.innerHTML = `
-        <div class="xhrl-header">
-            <span class="title">🕸 XHR/Fetch Logger Pro</span>
-            <input class="xhrl-search" id="xhrl-search" placeholder="filter url..." />
-            <button class="xhrl-btn" id="xhrl-export-json">JSON</button>
-            <button class="xhrl-btn" id="xhrl-export-curl">cURL</button>
-            <button class="xhrl-btn" id="xhrl-export-text">TEXT</button>
-            <button class="xhrl-btn danger" id="xhrl-clear">Clear</button>
-            <button class="xhrl-btn" id="xhrl-close">✕</button>
+        <div class="xhrl-header" id="xhrl-drag-handle">
+            <span class="title">🕸 XHR Logger<span class="ver">v2.0</span></span>
+            <input class="xhrl-search" id="xhrl-search" placeholder="filter..." />
+            <button class="xhrl-btn" id="xhrl-pause" title="Pause/Resume capture">⏸️</button>
+            <button class="xhrl-btn" id="xhrl-skipbody" title="Skip body (lightweight)">Skip Body</button>
+            <button class="xhrl-btn" id="xhrl-group" title="Group by domain">Group</button>
+            <button class="xhrl-btn" id="xhrl-autoclean" title="Auto-clear logs older than 60 seconds (protects selected + baseline)">Auto Clean</button>
+            <button class="xhrl-btn" id="xhrl-export-json">⬇️JSON</button>
+            <button class="xhrl-btn" id="xhrl-export-curl">⬇️cURL</button>
+            <button class="xhrl-btn" id="xhrl-export-text">⬇️TEXT</button>
+            <button class="xhrl-btn warn" id="xhrl-clear">🧹Clear</button>
+            <button class="xhrl-btn danger" id="xhrl-close">✕</button>
         </div>
         <div class="xhrl-body">
             <div class="xhrl-list" id="xhrl-list"><div class="xhrl-empty">No requests yet…</div></div>
             <div class="xhrl-detail" id="xhrl-detail"><div class="xhrl-empty">Select a request</div></div>
         </div>
         <div class="xhrl-diag" id="xhrl-diag"></div>
+        <div class="xhrl-resize" id="xhrl-resize"></div>
     `;
 
-    const mount = () => {
-        if (document.getElementById('xhr-logger-root')) return;
+    function applyPersistedGeometry() {
+        if (state.panelPos) {
+            panel.style.left = state.panelPos.left + 'px';
+            panel.style.top = state.panelPos.top + 'px';
+            panel.style.right = 'auto'; panel.style.bottom = 'auto';
+        } else {
+            panel.style.right = '20px'; panel.style.bottom = '80px';
+        }
+        if (state.panelSize) {
+            panel.style.width = state.panelSize.width + 'px';
+            panel.style.height = state.panelSize.height + 'px';
+        }
+    }
+
+    function mount() {
+        if (document.getElementById('xhrl-root')) return;
         const root = document.createElement('div');
-        root.id = 'xhr-logger-root';
+        root.id = 'xhrl-root';
         root.appendChild(fab);
         root.appendChild(panel);
         (document.body || document.documentElement).appendChild(root);
-    };
+        applyPersistedGeometry();
+    }
+
     if (document.body) mount();
     else {
         document.addEventListener('DOMContentLoaded', mount);
         const iv = setInterval(() => { if (document.body) { mount(); clearInterval(iv); } }, 100);
     }
 
-    let selectedId = null;
-    let filterText = '';
+    /* =========================================================
+     * 🎯 DRAG + RESIZE
+     * ========================================================= */
+    const makeDraggable = () => {
+        const handle = document.getElementById('xhrl-drag-handle');
+        if (!handle) return;
+        let sx, sy, ix, iy;
+        handle.addEventListener('mousedown', (e) => {
+            if (e.target.closest('button,input')) return;
+            sx = e.clientX; sy = e.clientY;
+            const r = panel.getBoundingClientRect();
+            ix = r.left; iy = r.top;
+            e.preventDefault();
+            const move = (ev) => {
+                let nx = ix + ev.clientX - sx;
+                let ny = iy + ev.clientY - sy;
+                nx = Math.max(0, Math.min(window.innerWidth - 50, nx));
+                ny = Math.max(0, Math.min(window.innerHeight - 30, ny));
+                panel.style.left = nx + 'px';
+                panel.style.top = ny + 'px';
+                panel.style.right = 'auto'; panel.style.bottom = 'auto';
+            };
+            const up = () => {
+                document.removeEventListener('mousemove', move);
+                document.removeEventListener('mouseup', up);
+                const r2 = panel.getBoundingClientRect();
+                state.panelPos = { left: r2.left, top: r2.top };
+                try { GM_setValue('panelPos', JSON.stringify(state.panelPos)); } catch (_) {}
+            };
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+        });
+    };
+
+    const makeResizable = () => {
+        const h = document.getElementById('xhrl-resize');
+        if (!h) return;
+        let sx, sy, iw, ih;
+        h.addEventListener('mousedown', (e) => {
+            sx = e.clientX; sy = e.clientY;
+            const r = panel.getBoundingClientRect();
+            iw = r.width; ih = r.height;
+            e.preventDefault(); e.stopPropagation();
+            const move = (ev) => {
+                panel.style.width = Math.max(500, iw + ev.clientX - sx) + 'px';
+                panel.style.height = Math.max(300, ih + ev.clientY - sy) + 'px';
+            };
+            const up = () => {
+                document.removeEventListener('mousemove', move);
+                document.removeEventListener('mouseup', up);
+                const r2 = panel.getBoundingClientRect();
+                state.panelSize = { width: r2.width, height: r2.height };
+                try { GM_setValue('panelSize', JSON.stringify(state.panelSize)); } catch (_) {}
+            };
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+        });
+    };
+
+    setTimeout(() => { makeDraggable(); makeResizable(); }, 0);
+
+    /* =========================================================
+     * 🖼 RENDER
+     * ========================================================= */
     let renderPending = false;
 
     function scheduleRender() {
@@ -420,6 +927,7 @@
         requestAnimationFrame(() => {
             renderPending = false;
             updateBadge();
+            updateStatusUI();
             if (panel.classList.contains('open')) renderList();
         });
     }
@@ -427,19 +935,37 @@
     const updateBadge = () => {
         const badge = fab.querySelector('.badge');
         if (!badge) return;
-        badge.style.display = store.length ? 'inline-block' : 'none';
-        badge.textContent = store.length;
+        badge.style.display = state.store.length ? 'inline-block' : 'none';
+        badge.textContent = state.store.length;
     };
 
-    const toast = (msg) => {
+    const updateStatusUI = () => {
+        fab.classList.toggle('paused', state.paused);
+        const pauseBtn = document.getElementById('xhrl-pause');
+        if (pauseBtn) { pauseBtn.textContent = state.paused ? '▶️' : '⏸️'; pauseBtn.classList.toggle('active', state.paused); }
+        const skipBtn = document.getElementById('xhrl-skipbody');
+        if (skipBtn) skipBtn.classList.toggle('active', state.skipBody);
+        const grpBtn = document.getElementById('xhrl-group');
+        if (grpBtn) grpBtn.classList.toggle('active', state.groupByDomain);
+        const autoBtn = document.getElementById('xhrl-autoclean');
+        if (autoBtn) {
+            const on = CONFIG.AUTO_CLEAR_MS > 0;
+            autoBtn.classList.toggle('active', on);
+            autoBtn.textContent = on ? '✓ Auto Clean' : 'Auto Clean';
+        }
+    };
+
+    const toast = (msg, color) => {
         const t = document.createElement('div');
         t.className = 'xhrl-toast';
+        if (color) t.style.background = color;
         t.textContent = msg;
         document.body.appendChild(t);
         setTimeout(() => t.remove(), 1600);
     };
 
     const toCurl = (log) => {
+        if (log.type === 'ws') return `# WebSocket: ${log.url}  (cURL cannot replay WS)`;
         let c = `curl '${log.url}' \\\n  -X ${log.method}`;
         Object.entries(log.requestHeaders || {}).forEach(([k, v]) => {
             c += ` \\\n  -H '${k}: ${String(v).replace(/'/g, "'\\''")}'`;
@@ -452,13 +978,19 @@
 
     const toText = (log) => {
         let s = `=== ${log.method} ${log.url}\n`;
-        s += `Time: ${log.time}  |  Status: ${log.status || '-'} ${log.statusText || ''}  |  ${log.duration || 0}ms  |  ${log.type}\n\n`;
-        s += `--- Request Headers ---\n`;
+        s += `Time: ${log.time}  |  Status: ${log.status || '-'} ${log.statusText || ''}  |  ${log.duration || 0}ms  |  ${log.type}`;
+        if (log.sensitive) s += `  |  ⚠ SENSITIVE(${log.sensitiveFlags.join(',')})`;
+        s += '\n\n--- Request Headers ---\n';
         Object.entries(log.requestHeaders || {}).forEach(([k, v]) => s += `${k}: ${v}\n`);
         if (log.requestBody) s += `\n--- Request Body ---\n${log.requestBody}\n`;
         s += `\n--- Response Headers ---\n`;
         Object.entries(log.responseHeaders || {}).forEach(([k, v]) => s += `${k}: ${v}\n`);
-        s += `\n--- Response Body ---\n${log.responseBody || ''}\n`;
+        if (log.type === 'ws') {
+            s += `\n--- WS Frames (${(log.frames || []).length}) ---\n`;
+            (log.frames || []).forEach(f => s += `[${new Date(f.time).toISOString()}] ${f.dir === 'in' ? '<' : '>'} ${f.data}\n`);
+        } else {
+            s += `\n--- Response Body ---\n${log.responseBody || ''}\n`;
+        }
         return s;
     };
 
@@ -473,105 +1005,238 @@
 
     const copy = (txt) => {
         try { GM_setClipboard(txt); toast('Copied!'); return; } catch (_) {}
-        try { navigator.clipboard.writeText(txt).then(() => toast('Copied!')); } catch (_) { toast('Copy failed'); }
+        try { navigator.clipboard.writeText(txt).then(() => toast('Copied!')); } catch (_) { toast('Copy failed', '#ef4444'); }
     };
 
     const esc = (s) => String(s == null ? '' : s)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-    const filtered = () => !filterText ? store : store.filter(l => l.url.toLowerCase().includes(filterText));
+    const filtered = () => !state.filter ? state.store : state.store.filter(l => l.url.toLowerCase().includes(state.filter));
 
     const renderList = () => {
         const listEl = document.getElementById('xhrl-list');
-        const diagEl = document.getElementById('xhrl-diag');
-        if (diagEl) {
-            diagEl.textContent = `v1.0 By TekMonts | Browser: ${isFirefox ? 'Firefox' : 'Chrome-like'} · unsafeWindow: ${W === window ? 'NO (same as window)' : 'YES'} · hook: ${hookMethod} · ok: ${hookOK} · logs: ${store.length}${hookError ? ' · err: ' + hookError : ''}`;
-            diagEl.className = hookOK ? 'xhrl-diag' : 'xhrl-diag err';
-        }
         if (!listEl) return;
         const logs = filtered();
+
         if (!logs.length) {
             let msg;
-            if (!hookOK && hookError) msg = `⚠ Hook failed: ${hookError}`;
-            else if (!hookOK) msg = `Installing hook (${hookMethod})…`;
-            else msg = 'Hook active. Waiting for requests… (try interacting with page)';
+            if (!state.hookOK && state.hookError) msg = `⚠ Hook failed: ${state.hookError}`;
+            else if (!state.hookOK) msg = `Installing hook…`;
+            else if (state.paused) msg = '⏸ Paused. Click ▶ to resume.';
+            else msg = 'Hook active. Waiting for requests…';
             listEl.innerHTML = '<div class="xhrl-empty">' + esc(msg) + '</div>';
             return;
         }
-        listEl.innerHTML = logs.slice().reverse().map(l => {
-            const sClass = 's-' + String(l.status || 0).charAt(0);
-            return `<div class="xhrl-item ${l.id === selectedId ? 'active' : ''}" data-id="${l.id}">
-                <span class="xhrl-method m-${l.method}">${l.method}</span>
-                <span class="xhrl-status ${sClass}">${l.status || '—'}</span>
-                <span class="xhrl-url" title="${esc(l.url)}">${esc(l.url)}</span>
-            </div>`;
-        }).join('');
+
+        // Render (with cap)
+        const reversed = logs.slice(-CONFIG.RENDER_CAP).reverse();
+
+        let html = '';
+        if (state.groupByDomain) {
+            const groups = {};
+            for (const l of reversed) {
+                (groups[l.hostname] = groups[l.hostname] || []).push(l);
+            }
+            for (const host of Object.keys(groups)) {
+                html += `<div class="xhrl-group-hdr">${esc(host)} · ${groups[host].length}</div>`;
+                html += groups[host].map(itemHTML).join('');
+            }
+        } else {
+            html = reversed.map(itemHTML).join('');
+        }
+
+        listEl.innerHTML = html;
         listEl.querySelectorAll('.xhrl-item').forEach(el => {
             el.addEventListener('click', () => {
-                selectedId = el.dataset.id;
+                state.selectedId = el.dataset.id;
                 renderList(); renderDetail();
             });
         });
     };
 
+    const itemHTML = (l) => {
+        const sClass = 's-' + String(l.status || 0).charAt(0);
+        const baseline = l.id === state.baselineId ? ' baseline' : '';
+        const active = l.id === state.selectedId ? ' active' : '';
+        const flag = l.sensitive ? '<span class="xhrl-flag" title="Sensitive">🔒</span>' : '';
+        const observed = l._observed ? '<span class="xhrl-flag" title="Captured via PerformanceObserver - fired before hook installed">👁</span>' : '';
+        const wsInfo = l.type === 'ws' ? ` · ${(l.frames || []).length}f` : '';
+
+        // In grouped view, strip hostname from display (it's already in group header)
+        let displayUrl = l.url;
+        if (state.groupByDomain && l.hostname && l.hostname !== '(local)') {
+            try {
+                const u = new URL(l.url);
+                displayUrl = (u.pathname || '/') + (u.search || '') + (u.hash || '');
+            } catch (_) {}
+        }
+
+        return `<div class="xhrl-item${active}${baseline}" data-id="${l.id}">
+            <span class="xhrl-method m-${l.method}">${l.method}</span>
+            <span class="xhrl-status ${sClass}">${l.status || '—'}</span>
+            ${flag}${observed}
+            <span class="xhrl-url" title="${esc(l.url)}">${esc(displayUrl)}${wsInfo}</span>
+        </div>`;
+    };
+
     const renderDetail = () => {
         const detailEl = document.getElementById('xhrl-detail');
         if (!detailEl) return;
-        const log = store.find(l => l.id === selectedId);
+        const log = state.store.find(l => l.id === state.selectedId);
         if (!log) { detailEl.innerHTML = '<div class="xhrl-empty">Select a request</div>'; return; }
+
+        const sensitiveTag = log.sensitive ? `<span class="xhrl-sensitive-tag" title="${esc(log.sensitiveFlags.join(', '))}">⚠ SENSITIVE</span>` : '';
+
+        let frameHTML = '';
+        if (log.type === 'ws') {
+            frameHTML = `<h4>WS Frames (${(log.frames || []).length}${log.closed ? ' · closed ' + log.closeCode : ''})</h4>`;
+            frameHTML += '<div>' + (log.frames || []).slice(-100).map(f =>
+                `<div class="xhrl-frame ${f.dir}"><span class="t">${new Date(f.time).toLocaleTimeString()}</span>${f.dir === 'in' ? '◀' : '▶'} ${esc(f.data)}</div>`
+            ).join('') + '</div>';
+        }
+
+        const diffHTML = (state.baselineId && state.baselineId !== log.id)
+            ? `<button class="xhrl-btn warn" data-act="do-diff">🔬 Diff vs baseline</button>` : '';
+
         detailEl.innerHTML = `
-            <div class="row"><b>${log.method}</b> <span>${esc(log.url)}</span></div>
-            <div class="row">Status: <b>${log.status || '-'} ${esc(log.statusText || '')}</b> · ${log.duration || 0}ms · ${log.type} · ${esc(log.time)}</div>
+            <div class="row"><b>${log.method}</b> <span>${esc(log.url)}</span> ${sensitiveTag}</div>
+            <div class="row">Status: <b>${log.status || '-'} ${esc(log.statusText || '')}</b> · ${log.duration || 0}ms · ${log.type} · host: <b>${esc(log.hostname)}</b> · ${esc(log.time)}</div>
             <div class="xhrl-actions">
                 <button class="xhrl-btn" data-act="copy-json">📋 JSON</button>
                 <button class="xhrl-btn" data-act="copy-curl">📋 cURL</button>
                 <button class="xhrl-btn" data-act="copy-text">📋 Text</button>
                 <button class="xhrl-btn" data-act="copy-body">📋 Response</button>
+                ${log.type !== 'ws' ? '<button class="xhrl-btn warn" data-act="replay">🔁 Replay</button>' : ''}
+                <button class="xhrl-btn" data-act="baseline">${log.id === state.baselineId ? '✓ Baseline' : '⭐ Set baseline'}</button>
+                ${diffHTML}
             </div>
+            <div id="xhrl-diff-output"></div>
             <h4>Request Headers</h4>
             <pre>${esc(JSON.stringify(log.requestHeaders || {}, null, 2))}</pre>
             ${log.requestBody ? `<h4>Request Body</h4><pre>${esc(log.requestBody)}</pre>` : ''}
             <h4>Response Headers</h4>
             <pre>${esc(JSON.stringify(log.responseHeaders || {}, null, 2))}</pre>
-            <h4>Response Body</h4>
-            <pre>${esc(log.responseBody || '')}</pre>
+            ${log.type === 'ws' ? frameHTML : `<h4>Response Body</h4><pre>${esc(log.responseBody || '')}</pre>`}
         `;
+
         detailEl.querySelectorAll('[data-act]').forEach(b => {
-            b.addEventListener('click', () => {
-                const act = b.dataset.act;
-                if (act === 'copy-json') copy(JSON.stringify(log, null, 2));
-                else if (act === 'copy-curl') copy(toCurl(log));
-                else if (act === 'copy-text') copy(toText(log));
-                else if (act === 'copy-body') copy(log.responseBody || '');
-            });
+            b.addEventListener('click', () => handleDetailAction(b.dataset.act, log));
         });
     };
 
+    const handleDetailAction = (act, log) => {
+        switch (act) {
+            case 'copy-json': copy(JSON.stringify(log, null, 2)); break;
+            case 'copy-curl': copy(toCurl(log)); break;
+            case 'copy-text': copy(toText(log)); break;
+            case 'copy-body': copy(log.responseBody || ''); break;
+            case 'replay':
+                toast('Replaying…', '#6366f1');
+                replay(log).then(r => {
+                    toast(`Replay: ${r.status} ${r.statusText}`, r.status < 400 ? '#10b981' : '#ef4444');
+                }).catch(e => toast('Replay failed: ' + e.message, '#ef4444'));
+                break;
+            case 'baseline':
+                state.baselineId = (state.baselineId === log.id) ? null : log.id;
+                toast(state.baselineId ? 'Baseline set' : 'Baseline cleared');
+                renderList(); renderDetail();
+                break;
+            case 'do-diff': {
+                const a = state.store.find(l => l.id === state.baselineId);
+                if (!a) return toast('Baseline not found', '#ef4444');
+                try {
+                    const changes = diff(a, log);
+                    const out = document.getElementById('xhrl-diff-output');
+                    if (!changes.length) { out.innerHTML = '<pre style="color:#6ee7b7">✓ No differences in response body</pre>'; return; }
+                    const html = changes.slice(0, 100).map(c => {
+                        if (c.type === 'added') return `<div class="xhrl-diff-added">+ ${esc(c.path)}: ${esc(JSON.stringify(c.to))}</div>`;
+                        if (c.type === 'removed') return `<div class="xhrl-diff-removed">- ${esc(c.path)}: ${esc(JSON.stringify(c.from))}</div>`;
+                        return `<div class="xhrl-diff-changed">~ ${esc(c.path)}: ${esc(JSON.stringify(c.from))} → ${esc(JSON.stringify(c.to))}</div>`;
+                    }).join('');
+                    out.innerHTML = `<h4>Diff (${changes.length} change${changes.length !== 1 ? 's' : ''})</h4><pre>${html}</pre>`;
+                } catch (e) { toast('Diff failed: ' + e.message, '#ef4444'); }
+                break;
+            }
+        }
+    };
+
+    const updateDiag = () => {
+        const diagEl = document.getElementById('xhrl-diag');
+        if (!diagEl) return;
+
+        // Auto-clean live countdown → time until next bulk sweep
+        let autoText = '';
+        if (CONFIG.AUTO_CLEAR_MS > 0 && state.autoClearNext) {
+            const ttl = CONFIG.AUTO_CLEAR_MS / 1000;
+            const remaining = Math.max(0, Math.ceil((state.autoClearNext - Date.now()) / 1000));
+            const color = remaining < 10 ? '#f87171' : '#fcd34d';
+            autoText = ` · 🧹<span style="color:${color}">AUTO sweep in ${remaining}s</span>`;
+        }
+
+        diagEl.innerHTML = `
+            <span>TekMonts | ${isFirefox ? '🦊 Firefox' : '🌐 Chrome'} · ${state.hookMethod} · ${state.hookOK ? '✓' : '✗'} · ${state.store.length}/${CONFIG.MAX_LOGS} logs${state.paused ? ' · ⏸️ PAUSED' : ''}${state.skipBody ? ' · NO-BODY' : ''}${autoText}</span>
+            <span>API: <code style="color:#a5b4fc">__XHR_LOGGER__</code></span>
+        `;
+        diagEl.className = state.hookOK ? 'xhrl-diag' : 'xhrl-diag err';
+    };
+
+    /* =========================================================
+     * 🖱 EVENT HANDLING
+     * ========================================================= */
     document.addEventListener('click', (e) => {
         const t = e.target;
         if (!t) return;
         if (t === fab || (fab && fab.contains(t))) {
             panel.classList.toggle('open');
-            renderList();
+            renderList(); renderDetail(); updateDiag();
             return;
         }
         if (!t.id) return;
-        if (t.id === 'xhrl-close') panel.classList.remove('open');
-        else if (t.id === 'xhrl-clear') {
-            store.length = 0; selectedId = null;
-            updateBadge(); renderList(); renderDetail();
+        switch (t.id) {
+            case 'xhrl-close': panel.classList.remove('open'); break;
+            case 'xhrl-clear':
+                state.store.length = 0; state.selectedId = null; state.baselineId = null;
+                updateBadge(); renderList(); renderDetail(); updateDiag();
+                break;
+            case 'xhrl-pause':
+                state.paused ? api.resume() : api.pause();
+                updateStatusUI(); renderList(); updateDiag();
+                break;
+            case 'xhrl-skipbody':
+                state.skipBody = !state.skipBody;
+                updateStatusUI(); updateDiag();
+                toast('Skip body: ' + (state.skipBody ? 'ON' : 'OFF'));
+                break;
+            case 'xhrl-group':
+                state.groupByDomain = !state.groupByDomain;
+                updateStatusUI(); renderList();
+                break;
+            case 'xhrl-autoclean': {
+                const newMs = CONFIG.AUTO_CLEAR_MS > 0 ? 0 : 60000;
+                setAutoClear(newMs);
+                updateStatusUI(); updateDiag();
+                toast(newMs ? '🧹 Auto-clean ON (60s)' : '🧹 Auto-clean OFF');
+                break;
+            }
+            case 'xhrl-export-json': download('xhr-log.json', JSON.stringify(state.store, null, 2), 'application/json'); break;
+            case 'xhrl-export-curl': download('xhr-log.sh', state.store.map(toCurl).join('\n\n'), 'text/plain'); break;
+            case 'xhrl-export-text': download('xhr-log.txt', state.store.map(toText).join('\n\n'), 'text/plain'); break;
         }
-        else if (t.id === 'xhrl-export-json') download('xhr-log.json', JSON.stringify(store, null, 2), 'application/json');
-        else if (t.id === 'xhrl-export-curl') download('xhr-log.sh', store.map(toCurl).join('\n\n'), 'text/plain');
-        else if (t.id === 'xhrl-export-text') download('xhr-log.txt', store.map(toText).join('\n\n'), 'text/plain');
     });
 
     document.addEventListener('input', (e) => {
         if (e.target && e.target.id === 'xhrl-search') {
-            filterText = e.target.value.toLowerCase();
+            state.filter = e.target.value.toLowerCase();
             renderList();
         }
     });
 
-    setTimeout(scheduleRender, 500);
+    // Periodic diag refresh
+    setInterval(updateDiag, 1000);
+    setTimeout(() => { scheduleRender(); updateDiag(); }, 300);
+
+    console.log(
+        '%c[XHR Logger v2.0] %cAPI ready: %c__XHR_LOGGER__.{pause, resume, clear, logs, replay, diff, setSkipBody, setMaxLogs, setAutoClear}',
+        'color:#a5b4fc;font-weight:700', 'color:#64748b', 'color:#6ee7b7;font-family:monospace'
+    );
 })();
