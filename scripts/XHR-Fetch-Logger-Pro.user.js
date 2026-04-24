@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         XHR/Fetch/WS Logger Pro
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
-// @description  XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. CSP-proof. Firefox + Chrome.
+// @version      2.1.0
+// @description  XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. Shadow DOM isolated. CSP-proof. Firefox + Chrome.
 // @author       TekMonts
 // @match        *://*/*
 // @grant        unsafeWindow
 // @grant        GM_setClipboard
-// @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @run-at       document-start
@@ -26,7 +25,7 @@
         RENDER_CAP: 400,
         WS_MAX_FRAMES: 500,
         WS_FRAME_BYTES: 20000,
-        AUTO_CLEAR_MS: 0,     // 0 = off
+        AUTO_CLEAR_MS: 0,
     };
 
     const state = {
@@ -43,11 +42,10 @@
         autoClearTimer: null,
         autoClearNext: 0,
         hookActivatedAt: 0,
-        panelPos: null,   // {left, top}
-        panelSize: null,  // {width, height}
+        panelPos: null,
+        panelSize: null,
     };
 
-    // Load persisted UI state
     try {
         state.panelPos = JSON.parse(GM_getValue('panelPos', 'null'));
         state.panelSize = JSON.parse(GM_getValue('panelSize', 'null'));
@@ -83,7 +81,6 @@
         return h;
     };
 
-    // Decode binary buffer: try UTF-8 text first, fallback to hex preview
     const decodeBinary = (buf) => {
         try {
             let view;
@@ -94,7 +91,6 @@
             const len = view.byteLength;
             const typeName = (buf.constructor && buf.constructor.name) || 'binary';
 
-            // Try UTF-8 decode + printability check
             try {
                 const text = new TextDecoder('utf-8', { fatal: false }).decode(view);
                 let nonPrintable = 0;
@@ -108,7 +104,6 @@
                 }
             } catch (_) {}
 
-            // Hex preview fallback
             const hexLen = Math.min(64, len);
             const hex = Array.from(view.slice(0, hexLen))
                 .map(b => b.toString(16).padStart(2, '0'))
@@ -119,7 +114,6 @@
         }
     };
 
-    // Serialize FormData to preview string
     const serializeFormData = (fd) => {
         try {
             const parts = [];
@@ -134,7 +128,6 @@
         } catch (_) { return '[FormData]'; }
     };
 
-    // Universal body encoder — text-first, binary-safe
     const encodeBody = (body) => {
         if (body == null) return null;
         if (typeof body === 'string') return truncate(body);
@@ -184,7 +177,6 @@
     const pushLog = (log) => {
         if (state.paused) return;
 
-        // Normalize URL → absolute (so cURL/replay/export always have hostname)
         try {
             if (log.url && !/^(https?|wss?|data|blob|file):/i.test(log.url)) {
                 log.url = new URL(log.url, location.href).href;
@@ -202,7 +194,6 @@
 
         state.store.push(log);
 
-        // Hard cap: drop oldest (but protect selected)
         if (state.store.length > CONFIG.MAX_LOGS) {
             const over = state.store.length - CONFIG.MAX_LOGS;
             let dropped = 0, i = 0;
@@ -216,10 +207,6 @@
             }
         }
 
-        scheduleRender();
-    };
-
-    const updateLog = (log) => {   // for WS frame updates without re-push
         scheduleRender();
     };
 
@@ -301,7 +288,7 @@
     };
 
     /* =========================================================
-     * 🪝 FETCH HOOK (async/await safe - returns original promise)
+     * 🪝 FETCH HOOK
      * ========================================================= */
     const installFetchHook = () => {
         const origFetch = W.fetch;
@@ -336,7 +323,6 @@
 
             const promise = origFetch.apply(this, arguments);
 
-            // Tap without breaking async/await chain
             promise.then(exportFn(function (res) {
                 try {
                     const clone = res.clone();
@@ -372,7 +358,7 @@
     };
 
     /* =========================================================
-     * 🪝 WEBSOCKET HOOK (both directions)
+     * 🪝 WEBSOCKET HOOK
      * ========================================================= */
     const wsLogMap = new WeakMap();
 
@@ -380,7 +366,6 @@
         const OrigWS = W.WebSocket;
         if (!OrigWS) return false;
 
-        // Hook send on prototype → catches outgoing frames
         const proto = OrigWS.prototype;
         const origSend = proto.send;
 
@@ -401,7 +386,6 @@
         try { proto.send = newSend; }
         catch (_) { Object.defineProperty(proto, 'send', { value: newSend, writable: true, configurable: true }); }
 
-        // Wrap constructor → attach message listener to catch incoming
         function HookedWS(url, protocols) {
             const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
 
@@ -437,7 +421,6 @@
             return ws;
         }
 
-        // Preserve prototype chain so `instanceof WebSocket` works
         HookedWS.prototype = OrigWS.prototype;
         try {
             ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => {
@@ -446,7 +429,6 @@
         } catch (_) {}
 
         const wrappedCtor = isFirefox ? exportFn(HookedWS) : HookedWS;
-        // Re-apply prototype after exportFn (on the page-side function)
         try { wrappedCtor.prototype = OrigWS.prototype; } catch (_) {}
         try {
             ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => {
@@ -502,27 +484,22 @@
     })();
 
     /* =========================================================
-     * 👁 SAFETY NET: PerformanceObserver catches requests that
-     *    fired BEFORE hooks installed (early page-load race).
+     * 👁 SAFETY NET: PerformanceObserver
      * ========================================================= */
     (function installPerformanceObserver() {
         if (typeof PerformanceObserver === 'undefined') return;
         try {
             const po = new PerformanceObserver((list) => {
                 for (const entry of list.getEntries()) {
-                    // Only interested in XHR/fetch
                     if (entry.initiatorType !== 'fetch' && entry.initiatorType !== 'xmlhttprequest') continue;
 
                     const absTime = performance.timeOrigin + entry.startTime;
 
-                    // Skip anything that happened AFTER hook was active — hook should have it
                     if (state.hookActivatedAt && absTime >= state.hookActivatedAt - 50) continue;
 
-                    // Normalize URL
                     let url;
                     try { url = new URL(entry.name, location.href).href; } catch (_) { url = entry.name; }
 
-                    // Dedup against existing logs (in case hook got it anyway)
                     const dup = state.store.some(l =>
                         l.url === url && Math.abs(l.startedAt - absTime) < 200
                     );
@@ -548,7 +525,6 @@
                 }
             });
             po.observe({ type: 'resource', buffered: true });
-            console.log('[XHR Logger] PerformanceObserver active (safety net for early requests)');
         } catch (e) {
             console.warn('[XHR Logger] PerformanceObserver setup failed:', e);
         }
@@ -559,10 +535,9 @@
      * ========================================================= */
     const replay = (log) => {
         if (!log) throw new Error('replay: no log given');
-        if (log.type === 'ws') throw new Error('replay: WebSocket replay not supported (use native new WebSocket)');
+        if (log.type === 'ws') throw new Error('replay: WebSocket replay not supported');
 
         const headers = {};
-        // Filter forbidden headers (browser controls these)
         const FORBIDDEN = /^(host|content-length|connection|accept-encoding|cookie|origin|referer|user-agent|sec-|proxy-|transfer-encoding|te|upgrade|keep-alive|expect|trailer)/i;
         for (const [k, v] of Object.entries(log.requestHeaders || {})) {
             if (!FORBIDDEN.test(k)) headers[k] = v;
@@ -578,17 +553,14 @@
             opts.body = log.requestBody;
         }
 
-        console.log('[XHR Logger] Replaying:', log.method, log.url);
         return fetch(log.url, opts).then(async res => {
             const text = await res.text();
-            const replayed = {
+            return {
                 status: res.status,
                 statusText: res.statusText,
                 headers: Object.fromEntries(res.headers.entries()),
                 body: text
             };
-            console.log('[XHR Logger] Replay result:', replayed);
-            return replayed;
         });
     };
 
@@ -645,7 +617,6 @@
         if (ms > 0) {
             state.autoClearNext = Date.now() + ms;
             state.autoClearTimer = setInterval(() => {
-                // Bulk clear: wipe all EXCEPT selected + baseline
                 state.store = state.store.filter(l =>
                     l.id === state.selectedId ||
                     l.id === state.baselineId
@@ -660,14 +631,14 @@
      * 🌐 PUBLIC API
      * ========================================================= */
     const api = {
-        pause: () => { state.paused = true; updateStatusUI(); console.log('[XHR Logger] ⏸️ Paused'); },
-        resume: () => { state.paused = false; updateStatusUI(); console.log('[XHR Logger] ▶️ Resumed'); },
-        clear: () => { state.store.length = 0; state.selectedId = null; state.baselineId = null; scheduleRender(); console.log('[XHR Logger] Cleared'); },
+        pause: () => { state.paused = true; updateStatusUI(); },
+        resume: () => { state.paused = false; updateStatusUI(); },
+        clear: () => { state.store.length = 0; state.selectedId = null; state.baselineId = null; scheduleRender(); },
         logs: () => state.store.slice(),
         replay,
         diff,
-        setSkipBody: (v) => { state.skipBody = !!v; console.log('[XHR Logger] skipBody:', state.skipBody); },
-        setMaxLogs: (n) => { CONFIG.MAX_LOGS = n; console.log('[XHR Logger] MAX_LOGS:', n); },
+        setSkipBody: (v) => { state.skipBody = !!v; },
+        setMaxLogs: (n) => { CONFIG.MAX_LOGS = n; },
         setAutoClear,
         config: CONFIG,
         state: () => ({ ...state, store: undefined })
@@ -680,75 +651,77 @@
     window.__XHR_LOGGER__ = api;
 
     /* =========================================================
-     * 🎨 UI
+     * 🎨 SHADOW DOM UI
      * ========================================================= */
-    GM_addStyle(`
-        #xhrl-root, #xhrl-root * { box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; }
-        #xhrl-fab {
+    const CSS = `
+        :host { all: initial !important; }
+        * { box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+        #fab {
             position: fixed; z-index: 2147483646; bottom: 20px; right: 20px;
             width: 48px; height: 48px; border-radius: 50%;
             background: linear-gradient(135deg,#6366f1,#8b5cf6); color: #fff;
             display: flex; align-items: center; justify-content: center;
             cursor: pointer; box-shadow: 0 6px 20px rgba(99,102,241,.5);
             font-weight: 700; font-size: 18px; user-select: none;
-            transition: transform .2s;
+            transition: transform .2s; pointer-events: auto;
         }
-        #xhrl-fab:hover { transform: scale(1.08); }
-        #xhrl-fab.paused { background: linear-gradient(135deg,#ef4444,#f97316); }
-        #xhrl-fab .badge {
+        #fab:hover { transform: scale(1.08); }
+        #fab.paused { background: linear-gradient(135deg,#ef4444,#f97316); }
+        #fab .badge {
             position: absolute; top: -4px; right: -4px; background: #ef4444;
             color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 10px;
             min-width: 20px; text-align: center; font-weight: 700;
         }
-        #xhrl-panel {
+        #panel {
             position: fixed; z-index: 2147483647;
             width: 850px; max-width: 95vw; height: 560px; max-height: 85vh;
             background: #0f172a; color: #e2e8f0;
             border: 1px solid #334155; border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0,0,0,.6);
             display: none; flex-direction: column; overflow: hidden;
-            min-width: 500px; min-height: 300px;
+            min-width: 500px; min-height: 300px; pointer-events: auto;
         }
-        #xhrl-panel.open { display: flex; }
-        .xhrl-header {
+        #panel.open { display: flex; }
+        .header {
             display: flex; align-items: center; gap: 6px; padding: 8px 10px;
             background: #1e293b; border-bottom: 1px solid #334155; flex-wrap: wrap;
             cursor: move; user-select: none;
         }
-        .xhrl-header .title { font-weight: 700; color: #a5b4fc; flex: 1; font-size: 12px; }
-        .xhrl-header .title .ver { color: #64748b; font-weight: 400; font-size: 10px; margin-left: 4px; }
-        .xhrl-header input, .xhrl-header button { cursor: auto; }
-        .xhrl-btn {
+        .header .title { font-weight: 700; color: #a5b4fc; flex: 1; font-size: 12px; }
+        .header .title .ver { color: #64748b; font-weight: 400; font-size: 10px; margin-left: 4px; }
+        .header input, .header button { cursor: auto; }
+        .btn {
             background: #334155; color: #e2e8f0; border: none; padding: 4px 8px;
             border-radius: 5px; font-size: 11px; cursor: pointer; font-family: inherit;
             white-space: nowrap;
         }
-        .xhrl-btn:hover { background: #475569; }
-        .xhrl-btn.active { background: #6366f1; }
-        .xhrl-btn.danger { background: #7f1d1d; }
-        .xhrl-btn.danger:hover { background: #991b1b; }
-        .xhrl-btn.warn { background: #92400e; }
-        .xhrl-btn.warn:hover { background: #b45309; }
-        .xhrl-search {
+        .btn:hover { background: #475569; }
+        .btn.active { background: #6366f1; }
+        .btn.danger { background: #7f1d1d; }
+        .btn.danger:hover { background: #991b1b; }
+        .btn.warn { background: #92400e; }
+        .btn.warn:hover { background: #b45309; }
+        .search {
             padding: 5px 8px; background: #0f172a; border: 1px solid #334155;
             color: #e2e8f0; border-radius: 5px; font-size: 11px; width: 140px;
             font-family: inherit;
         }
-        .xhrl-body { display: flex; flex: 1; overflow: hidden; }
-        .xhrl-list { width: 42%; overflow-y: auto; border-right: 1px solid #334155; }
-        .xhrl-group-hdr {
+        .body { display: flex; flex: 1; overflow: hidden; }
+        .list { width: 42%; overflow-y: auto; border-right: 1px solid #334155; }
+        .group-hdr {
             padding: 4px 10px; background: #1e293b; color: #94a3b8;
             font-size: 10px; font-weight: 700; position: sticky; top: 0; z-index: 2;
             border-bottom: 1px solid #0f172a;
         }
-        .xhrl-item {
+        .item {
             padding: 6px 10px; border-bottom: 1px solid #1e293b; cursor: pointer;
             font-size: 11px; display: flex; gap: 5px; align-items: center;
         }
-        .xhrl-item:hover { background: #1e293b; }
-        .xhrl-item.active { background: #312e81; }
-        .xhrl-item.baseline { border-left: 3px solid #fbbf24; padding-left: 7px; }
-        .xhrl-method {
+        .item:hover { background: #1e293b; }
+        .item.active { background: #312e81; }
+        .item.baseline { border-left: 3px solid #fbbf24; padding-left: 7px; }
+        .method {
             padding: 1px 5px; border-radius: 3px; font-weight: 700; font-size: 9px;
             min-width: 40px; text-align: center;
         }
@@ -758,72 +731,92 @@
         .m-DELETE { background: #991b1b; color: #fca5a5; }
         .m-PATCH { background: #5b21b6; color: #c4b5fd; }
         .m-WS { background: #134e4a; color: #5eead4; }
-        .xhrl-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .xhrl-status { font-weight: 700; font-size: 10px; min-width: 28px; }
+        .url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status { font-weight: 700; font-size: 10px; min-width: 28px; }
         .s-2 { color: #6ee7b7; } .s-3 { color: #fcd34d; }
         .s-4 { color: #fca5a5; } .s-5 { color: #f87171; } .s-0 { color: #94a3b8; }
-        .xhrl-flag { font-size: 10px; }
-        .xhrl-detail {
+        .flag { font-size: 10px; }
+        .detail {
             flex: 1; overflow-y: auto; padding: 10px; font-size: 11px;
             background: #020617;
         }
-        .xhrl-detail h4 { color: #a5b4fc; margin: 8px 0 4px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
-        .xhrl-detail pre {
+        .detail h4 { color: #a5b4fc; margin: 8px 0 4px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+        .detail pre {
             background: #0f172a; padding: 8px; border-radius: 6px;
             overflow-x: auto; white-space: pre-wrap; word-break: break-all;
             border: 1px solid #1e293b; margin: 0; color: #cbd5e1; max-height: 300px;
         }
-        .xhrl-detail .row { display: flex; gap: 6px; margin-bottom: 4px; word-break: break-all; align-items: baseline; flex-wrap: wrap; }
-        .xhrl-actions { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
-        .xhrl-empty { padding: 20px; text-align: center; color: #64748b; font-size: 12px; }
-        .xhrl-toast {
+        .detail .row { display: flex; gap: 6px; margin-bottom: 4px; word-break: break-all; align-items: baseline; flex-wrap: wrap; }
+        .actions { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
+        .empty { padding: 20px; text-align: center; color: #64748b; font-size: 12px; }
+        .toast {
             position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
             background: #10b981; color: #fff; padding: 8px 16px; border-radius: 6px;
-            font-size: 12px; z-index: 2147483647; font-family: ui-monospace,monospace;
+            font-size: 12px; z-index: 2147483647; pointer-events: auto;
         }
-        .xhrl-diag { font-size: 10px; color: #94a3b8; padding: 5px 10px; background: #0b1120; border-top: 1px solid #1e293b; display: flex; justify-content: space-between; gap: 8px; }
-        .xhrl-diag.err { color: #fca5a5; }
-        .xhrl-sensitive-tag { background: #7f1d1d; color: #fecaca; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 700; }
-        .xhrl-frame { padding: 4px 8px; margin: 2px 0; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; border-left: 3px solid; }
-        .xhrl-frame.in { background: #0c2e1a; border-color: #10b981; }
-        .xhrl-frame.out { background: #1e1b4b; border-color: #6366f1; }
-        .xhrl-frame .t { color: #64748b; font-size: 10px; margin-right: 6px; }
-        .xhrl-resize {
+        .diag { font-size: 10px; color: #94a3b8; padding: 5px 10px; background: #0b1120; border-top: 1px solid #1e293b; display: flex; justify-content: space-between; gap: 8px; }
+        .diag.err { color: #fca5a5; }
+        .sensitive-tag { background: #7f1d1d; color: #fecaca; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 700; }
+        .frame { padding: 4px 8px; margin: 2px 0; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; border-left: 3px solid; }
+        .frame.in { background: #0c2e1a; border-color: #10b981; }
+        .frame.out { background: #1e1b4b; border-color: #6366f1; }
+        .frame .t { color: #64748b; font-size: 10px; margin-right: 6px; }
+        .resize {
             position: absolute; right: 0; bottom: 0; width: 14px; height: 14px;
             cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, #475569 50%);
         }
-        .xhrl-diff-added { color: #6ee7b7; }
-        .xhrl-diff-removed { color: #fca5a5; text-decoration: line-through; }
-        .xhrl-diff-changed { color: #fcd34d; }
-    `);
-
-    const fab = document.createElement('div');
-    fab.id = 'xhrl-fab';
-    fab.innerHTML = '🕸<span class="badge" style="display:none">0</span>';
-
-    const panel = document.createElement('div');
-    panel.id = 'xhrl-panel';
-    panel.innerHTML = `
-        <div class="xhrl-header" id="xhrl-drag-handle">
-            <span class="title">🕸 XHR Logger<span class="ver">v2.0</span></span>
-            <input class="xhrl-search" id="xhrl-search" placeholder="filter..." />
-            <button class="xhrl-btn" id="xhrl-pause" title="Pause/Resume capture">⏸️</button>
-            <button class="xhrl-btn" id="xhrl-skipbody" title="Skip body (lightweight)">Skip Body</button>
-            <button class="xhrl-btn" id="xhrl-group" title="Group by domain">Group</button>
-            <button class="xhrl-btn" id="xhrl-autoclean" title="Auto-clear logs older than 60 seconds (protects selected + baseline)">Auto Clean</button>
-            <button class="xhrl-btn" id="xhrl-export-json">⬇️JSON</button>
-            <button class="xhrl-btn" id="xhrl-export-curl">⬇️cURL</button>
-            <button class="xhrl-btn" id="xhrl-export-text">⬇️TEXT</button>
-            <button class="xhrl-btn warn" id="xhrl-clear">🧹Clear</button>
-            <button class="xhrl-btn danger" id="xhrl-close">✕</button>
-        </div>
-        <div class="xhrl-body">
-            <div class="xhrl-list" id="xhrl-list"><div class="xhrl-empty">No requests yet…</div></div>
-            <div class="xhrl-detail" id="xhrl-detail"><div class="xhrl-empty">Select a request</div></div>
-        </div>
-        <div class="xhrl-diag" id="xhrl-diag"></div>
-        <div class="xhrl-resize" id="xhrl-resize"></div>
+        .diff-added { color: #6ee7b7; }
+        .diff-removed { color: #fca5a5; text-decoration: line-through; }
+        .diff-changed { color: #fcd34d; }
     `;
+
+    /* === CREATE SHADOW HOST === */
+    const host = document.createElement('div');
+    host.id = '__xhr_logger_host__';
+    // Host itself is invisible 0x0; children are position:fixed so they show in viewport
+    // pointer-events:none on host so it doesn't block clicks on page beneath
+    host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
+    const shadow = host.attachShadow({ mode: 'open' });
+
+    // Helper: query within shadow
+    const $ = (id) => shadow.getElementById(id);
+
+    // Style
+    const styleEl = document.createElement('style');
+    styleEl.textContent = CSS;
+    shadow.appendChild(styleEl);
+
+    // FAB
+    const fab = document.createElement('div');
+    fab.id = 'fab';
+    fab.innerHTML = '🕸<span class="badge" style="display:none">0</span>';
+    shadow.appendChild(fab);
+
+    // Panel
+    const panel = document.createElement('div');
+    panel.id = 'panel';
+    panel.innerHTML = `
+        <div class="header" id="drag-handle">
+            <span class="title">🕸 XHR Logger<span class="ver">v2.1</span></span>
+            <input class="search" id="search" placeholder="filter..." />
+            <button class="btn" id="pause" title="Pause/Resume">⏸️</button>
+            <button class="btn" id="skipbody" title="Skip body">Skip Body</button>
+            <button class="btn" id="group" title="Group by domain">Group</button>
+            <button class="btn" id="autoclean" title="Auto-clear every 60s">Auto Clean</button>
+            <button class="btn" id="export-json">⬇️JSON</button>
+            <button class="btn" id="export-curl">⬇️cURL</button>
+            <button class="btn" id="export-text">⬇️TEXT</button>
+            <button class="btn warn" id="clear-btn">🧹Clear</button>
+            <button class="btn danger" id="close-btn">✕</button>
+        </div>
+        <div class="body">
+            <div class="list" id="list"><div class="empty">No requests yet…</div></div>
+            <div class="detail" id="detail"><div class="empty">Select a request</div></div>
+        </div>
+        <div class="diag" id="diag"></div>
+        <div class="resize" id="resize"></div>
+    `;
+    shadow.appendChild(panel);
 
     function applyPersistedGeometry() {
         if (state.panelPos) {
@@ -840,13 +833,10 @@
     }
 
     function mount() {
-        if (document.getElementById('xhrl-root')) return;
-        const root = document.createElement('div');
-        root.id = 'xhrl-root';
-        root.appendChild(fab);
-        root.appendChild(panel);
-        (document.body || document.documentElement).appendChild(root);
+        if (document.getElementById('__xhr_logger_host__')) return;
+        (document.body || document.documentElement).appendChild(host);
         applyPersistedGeometry();
+        wireEvents();
     }
 
     if (document.body) mount();
@@ -856,65 +846,119 @@
     }
 
     /* =========================================================
-     * 🎯 DRAG + RESIZE
+     * 🎯 DRAG + RESIZE + EVENT WIRING
      * ========================================================= */
-    const makeDraggable = () => {
-        const handle = document.getElementById('xhrl-drag-handle');
-        if (!handle) return;
-        let sx, sy, ix, iy;
-        handle.addEventListener('mousedown', (e) => {
-            if (e.target.closest('button,input')) return;
-            sx = e.clientX; sy = e.clientY;
-            const r = panel.getBoundingClientRect();
-            ix = r.left; iy = r.top;
-            e.preventDefault();
-            const move = (ev) => {
-                let nx = ix + ev.clientX - sx;
-                let ny = iy + ev.clientY - sy;
-                nx = Math.max(0, Math.min(window.innerWidth - 50, nx));
-                ny = Math.max(0, Math.min(window.innerHeight - 30, ny));
-                panel.style.left = nx + 'px';
-                panel.style.top = ny + 'px';
-                panel.style.right = 'auto'; panel.style.bottom = 'auto';
-            };
-            const up = () => {
-                document.removeEventListener('mousemove', move);
-                document.removeEventListener('mouseup', up);
-                const r2 = panel.getBoundingClientRect();
-                state.panelPos = { left: r2.left, top: r2.top };
-                try { GM_setValue('panelPos', JSON.stringify(state.panelPos)); } catch (_) {}
-            };
-            document.addEventListener('mousemove', move);
-            document.addEventListener('mouseup', up);
-        });
-    };
+    let eventsWired = false;
+    function wireEvents() {
+        if (eventsWired) return;
+        eventsWired = true;
 
-    const makeResizable = () => {
-        const h = document.getElementById('xhrl-resize');
-        if (!h) return;
-        let sx, sy, iw, ih;
-        h.addEventListener('mousedown', (e) => {
-            sx = e.clientX; sy = e.clientY;
-            const r = panel.getBoundingClientRect();
-            iw = r.width; ih = r.height;
-            e.preventDefault(); e.stopPropagation();
-            const move = (ev) => {
-                panel.style.width = Math.max(500, iw + ev.clientX - sx) + 'px';
-                panel.style.height = Math.max(300, ih + ev.clientY - sy) + 'px';
-            };
-            const up = () => {
-                document.removeEventListener('mousemove', move);
-                document.removeEventListener('mouseup', up);
-                const r2 = panel.getBoundingClientRect();
-                state.panelSize = { width: r2.width, height: r2.height };
-                try { GM_setValue('panelSize', JSON.stringify(state.panelSize)); } catch (_) {}
-            };
-            document.addEventListener('mousemove', move);
-            document.addEventListener('mouseup', up);
-        });
-    };
+        // Click delegation - listen on shadow so e.target is the actual inner element
+        shadow.addEventListener('click', (e) => {
+            const t = e.target;
+            if (!t) return;
 
-    setTimeout(() => { makeDraggable(); makeResizable(); }, 0);
+            // FAB toggles panel
+            if (t === fab || fab.contains(t)) {
+                panel.classList.toggle('open');
+                renderList(); renderDetail(); updateDiag();
+                return;
+            }
+
+            if (!t.id) return;
+            switch (t.id) {
+                case 'close-btn': panel.classList.remove('open'); break;
+                case 'clear-btn':
+                    state.store.length = 0; state.selectedId = null; state.baselineId = null;
+                    updateBadge(); renderList(); renderDetail(); updateDiag();
+                    break;
+                case 'pause':
+                    state.paused ? api.resume() : api.pause();
+                    updateStatusUI(); renderList(); updateDiag();
+                    break;
+                case 'skipbody':
+                    state.skipBody = !state.skipBody;
+                    updateStatusUI(); updateDiag();
+                    toast('Skip body: ' + (state.skipBody ? 'ON' : 'OFF'));
+                    break;
+                case 'group':
+                    state.groupByDomain = !state.groupByDomain;
+                    updateStatusUI(); renderList();
+                    break;
+                case 'autoclean': {
+                    const newMs = CONFIG.AUTO_CLEAR_MS > 0 ? 0 : 60000;
+                    setAutoClear(newMs);
+                    updateStatusUI(); updateDiag();
+                    toast(newMs ? '🧹 Auto-clean ON (60s)' : '🧹 Auto-clean OFF');
+                    break;
+                }
+                case 'export-json': download('xhr-log.json', JSON.stringify(state.store, null, 2), 'application/json'); break;
+                case 'export-curl': download('xhr-log.sh', state.store.map(toCurl).join('\n\n'), 'text/plain'); break;
+                case 'export-text': download('xhr-log.txt', state.store.map(toText).join('\n\n'), 'text/plain'); break;
+            }
+        });
+
+        shadow.addEventListener('input', (e) => {
+            if (e.target && e.target.id === 'search') {
+                state.filter = e.target.value.toLowerCase();
+                renderList();
+            }
+        });
+
+        // Drag
+        const handle = $('drag-handle');
+        if (handle) {
+            handle.addEventListener('mousedown', (e) => {
+                if (e.target.closest('button,input')) return;
+                const sx = e.clientX, sy = e.clientY;
+                const r = panel.getBoundingClientRect();
+                const ix = r.left, iy = r.top;
+                e.preventDefault();
+                const move = (ev) => {
+                    let nx = ix + ev.clientX - sx;
+                    let ny = iy + ev.clientY - sy;
+                    nx = Math.max(0, Math.min(window.innerWidth - 50, nx));
+                    ny = Math.max(0, Math.min(window.innerHeight - 30, ny));
+                    panel.style.left = nx + 'px';
+                    panel.style.top = ny + 'px';
+                    panel.style.right = 'auto'; panel.style.bottom = 'auto';
+                };
+                const up = () => {
+                    document.removeEventListener('mousemove', move);
+                    document.removeEventListener('mouseup', up);
+                    const r2 = panel.getBoundingClientRect();
+                    state.panelPos = { left: r2.left, top: r2.top };
+                    try { GM_setValue('panelPos', JSON.stringify(state.panelPos)); } catch (_) {}
+                };
+                document.addEventListener('mousemove', move);
+                document.addEventListener('mouseup', up);
+            });
+        }
+
+        // Resize
+        const resize = $('resize');
+        if (resize) {
+            resize.addEventListener('mousedown', (e) => {
+                const sx = e.clientX, sy = e.clientY;
+                const r = panel.getBoundingClientRect();
+                const iw = r.width, ih = r.height;
+                e.preventDefault(); e.stopPropagation();
+                const move = (ev) => {
+                    panel.style.width = Math.max(500, iw + ev.clientX - sx) + 'px';
+                    panel.style.height = Math.max(300, ih + ev.clientY - sy) + 'px';
+                };
+                const up = () => {
+                    document.removeEventListener('mousemove', move);
+                    document.removeEventListener('mouseup', up);
+                    const r2 = panel.getBoundingClientRect();
+                    state.panelSize = { width: r2.width, height: r2.height };
+                    try { GM_setValue('panelSize', JSON.stringify(state.panelSize)); } catch (_) {}
+                };
+                document.addEventListener('mousemove', move);
+                document.addEventListener('mouseup', up);
+            });
+        }
+    }
 
     /* =========================================================
      * 🖼 RENDER
@@ -932,40 +976,40 @@
         });
     }
 
-    const updateBadge = () => {
+    function updateBadge() {
         const badge = fab.querySelector('.badge');
         if (!badge) return;
         badge.style.display = state.store.length ? 'inline-block' : 'none';
         badge.textContent = state.store.length;
-    };
+    }
 
-    const updateStatusUI = () => {
+    function updateStatusUI() {
         fab.classList.toggle('paused', state.paused);
-        const pauseBtn = document.getElementById('xhrl-pause');
+        const pauseBtn = $('pause');
         if (pauseBtn) { pauseBtn.textContent = state.paused ? '▶️' : '⏸️'; pauseBtn.classList.toggle('active', state.paused); }
-        const skipBtn = document.getElementById('xhrl-skipbody');
+        const skipBtn = $('skipbody');
         if (skipBtn) skipBtn.classList.toggle('active', state.skipBody);
-        const grpBtn = document.getElementById('xhrl-group');
+        const grpBtn = $('group');
         if (grpBtn) grpBtn.classList.toggle('active', state.groupByDomain);
-        const autoBtn = document.getElementById('xhrl-autoclean');
+        const autoBtn = $('autoclean');
         if (autoBtn) {
             const on = CONFIG.AUTO_CLEAR_MS > 0;
             autoBtn.classList.toggle('active', on);
             autoBtn.textContent = on ? '✓ Auto Clean' : 'Auto Clean';
         }
-    };
+    }
 
-    const toast = (msg, color) => {
+    function toast(msg, color) {
         const t = document.createElement('div');
-        t.className = 'xhrl-toast';
+        t.className = 'toast';
         if (color) t.style.background = color;
         t.textContent = msg;
-        document.body.appendChild(t);
+        shadow.appendChild(t);
         setTimeout(() => t.remove(), 1600);
-    };
+    }
 
     const toCurl = (log) => {
-        if (log.type === 'ws') return `# WebSocket: ${log.url}  (cURL cannot replay WS)`;
+        if (log.type === 'ws') return `# WebSocket: ${log.url}`;
         let c = `curl '${log.url}' \\\n  -X ${log.method}`;
         Object.entries(log.requestHeaders || {}).forEach(([k, v]) => {
             c += ` \\\n  -H '${k}: ${String(v).replace(/'/g, "'\\''")}'`;
@@ -1013,8 +1057,8 @@
 
     const filtered = () => !state.filter ? state.store : state.store.filter(l => l.url.toLowerCase().includes(state.filter));
 
-    const renderList = () => {
-        const listEl = document.getElementById('xhrl-list');
+    function renderList() {
+        const listEl = $('list');
         if (!listEl) return;
         const logs = filtered();
 
@@ -1024,11 +1068,10 @@
             else if (!state.hookOK) msg = `Installing hook…`;
             else if (state.paused) msg = '⏸ Paused. Click ▶ to resume.';
             else msg = 'Hook active. Waiting for requests…';
-            listEl.innerHTML = '<div class="xhrl-empty">' + esc(msg) + '</div>';
+            listEl.innerHTML = '<div class="empty">' + esc(msg) + '</div>';
             return;
         }
 
-        // Render (with cap)
         const reversed = logs.slice(-CONFIG.RENDER_CAP).reverse();
 
         let html = '';
@@ -1038,7 +1081,7 @@
                 (groups[l.hostname] = groups[l.hostname] || []).push(l);
             }
             for (const host of Object.keys(groups)) {
-                html += `<div class="xhrl-group-hdr">${esc(host)} · ${groups[host].length}</div>`;
+                html += `<div class="group-hdr">${esc(host)} · ${groups[host].length}</div>`;
                 html += groups[host].map(itemHTML).join('');
             }
         } else {
@@ -1046,23 +1089,22 @@
         }
 
         listEl.innerHTML = html;
-        listEl.querySelectorAll('.xhrl-item').forEach(el => {
+        listEl.querySelectorAll('.item').forEach(el => {
             el.addEventListener('click', () => {
                 state.selectedId = el.dataset.id;
                 renderList(); renderDetail();
             });
         });
-    };
+    }
 
     const itemHTML = (l) => {
         const sClass = 's-' + String(l.status || 0).charAt(0);
         const baseline = l.id === state.baselineId ? ' baseline' : '';
         const active = l.id === state.selectedId ? ' active' : '';
-        const flag = l.sensitive ? '<span class="xhrl-flag" title="Sensitive">🔒</span>' : '';
-        const observed = l._observed ? '<span class="xhrl-flag" title="Captured via PerformanceObserver - fired before hook installed">👁</span>' : '';
+        const flag = l.sensitive ? '<span class="flag" title="Sensitive">🔒</span>' : '';
+        const observed = l._observed ? '<span class="flag" title="Captured via PerformanceObserver - fired before hook installed">👁</span>' : '';
         const wsInfo = l.type === 'ws' ? ` · ${(l.frames || []).length}f` : '';
 
-        // In grouped view, strip hostname from display (it's already in group header)
         let displayUrl = l.url;
         if (state.groupByDomain && l.hostname && l.hostname !== '(local)') {
             try {
@@ -1071,46 +1113,46 @@
             } catch (_) {}
         }
 
-        return `<div class="xhrl-item${active}${baseline}" data-id="${l.id}">
-            <span class="xhrl-method m-${l.method}">${l.method}</span>
-            <span class="xhrl-status ${sClass}">${l.status || '—'}</span>
+        return `<div class="item${active}${baseline}" data-id="${l.id}">
+            <span class="method m-${l.method}">${l.method}</span>
+            <span class="status ${sClass}">${l.status || '—'}</span>
             ${flag}${observed}
-            <span class="xhrl-url" title="${esc(l.url)}">${esc(displayUrl)}${wsInfo}</span>
+            <span class="url" title="${esc(l.url)}">${esc(displayUrl)}${wsInfo}</span>
         </div>`;
     };
 
-    const renderDetail = () => {
-        const detailEl = document.getElementById('xhrl-detail');
+    function renderDetail() {
+        const detailEl = $('detail');
         if (!detailEl) return;
         const log = state.store.find(l => l.id === state.selectedId);
-        if (!log) { detailEl.innerHTML = '<div class="xhrl-empty">Select a request</div>'; return; }
+        if (!log) { detailEl.innerHTML = '<div class="empty">Select a request</div>'; return; }
 
-        const sensitiveTag = log.sensitive ? `<span class="xhrl-sensitive-tag" title="${esc(log.sensitiveFlags.join(', '))}">⚠ SENSITIVE</span>` : '';
+        const sensitiveTag = log.sensitive ? `<span class="sensitive-tag" title="${esc(log.sensitiveFlags.join(', '))}">⚠ SENSITIVE</span>` : '';
 
         let frameHTML = '';
         if (log.type === 'ws') {
             frameHTML = `<h4>WS Frames (${(log.frames || []).length}${log.closed ? ' · closed ' + log.closeCode : ''})</h4>`;
             frameHTML += '<div>' + (log.frames || []).slice(-100).map(f =>
-                `<div class="xhrl-frame ${f.dir}"><span class="t">${new Date(f.time).toLocaleTimeString()}</span>${f.dir === 'in' ? '◀' : '▶'} ${esc(f.data)}</div>`
+                `<div class="frame ${f.dir}"><span class="t">${new Date(f.time).toLocaleTimeString()}</span>${f.dir === 'in' ? '◀' : '▶'} ${esc(f.data)}</div>`
             ).join('') + '</div>';
         }
 
         const diffHTML = (state.baselineId && state.baselineId !== log.id)
-            ? `<button class="xhrl-btn warn" data-act="do-diff">🔬 Diff vs baseline</button>` : '';
+            ? `<button class="btn warn" data-act="do-diff">🔬 Diff vs baseline</button>` : '';
 
         detailEl.innerHTML = `
             <div class="row"><b>${log.method}</b> <span>${esc(log.url)}</span> ${sensitiveTag}</div>
             <div class="row">Status: <b>${log.status || '-'} ${esc(log.statusText || '')}</b> · ${log.duration || 0}ms · ${log.type} · host: <b>${esc(log.hostname)}</b> · ${esc(log.time)}</div>
-            <div class="xhrl-actions">
-                <button class="xhrl-btn" data-act="copy-json">📋 JSON</button>
-                <button class="xhrl-btn" data-act="copy-curl">📋 cURL</button>
-                <button class="xhrl-btn" data-act="copy-text">📋 Text</button>
-                <button class="xhrl-btn" data-act="copy-body">📋 Response</button>
-                ${log.type !== 'ws' ? '<button class="xhrl-btn warn" data-act="replay">🔁 Replay</button>' : ''}
-                <button class="xhrl-btn" data-act="baseline">${log.id === state.baselineId ? '✓ Baseline' : '⭐ Set baseline'}</button>
+            <div class="actions">
+                <button class="btn" data-act="copy-json">📋 JSON</button>
+                <button class="btn" data-act="copy-curl">📋 cURL</button>
+                <button class="btn" data-act="copy-text">📋 Text</button>
+                <button class="btn" data-act="copy-body">📋 Response</button>
+                ${log.type !== 'ws' ? '<button class="btn warn" data-act="replay">🔁 Replay</button>' : ''}
+                <button class="btn" data-act="baseline">${log.id === state.baselineId ? '✓ Baseline' : '⭐ Set baseline'}</button>
                 ${diffHTML}
             </div>
-            <div id="xhrl-diff-output"></div>
+            <div id="diff-output"></div>
             <h4>Request Headers</h4>
             <pre>${esc(JSON.stringify(log.requestHeaders || {}, null, 2))}</pre>
             ${log.requestBody ? `<h4>Request Body</h4><pre>${esc(log.requestBody)}</pre>` : ''}
@@ -1122,7 +1164,7 @@
         detailEl.querySelectorAll('[data-act]').forEach(b => {
             b.addEventListener('click', () => handleDetailAction(b.dataset.act, log));
         });
-    };
+    }
 
     const handleDetailAction = (act, log) => {
         switch (act) {
@@ -1146,12 +1188,12 @@
                 if (!a) return toast('Baseline not found', '#ef4444');
                 try {
                     const changes = diff(a, log);
-                    const out = document.getElementById('xhrl-diff-output');
-                    if (!changes.length) { out.innerHTML = '<pre style="color:#6ee7b7">✓ No differences in response body</pre>'; return; }
+                    const out = $('diff-output');
+                    if (!changes.length) { out.innerHTML = '<pre style="color:#6ee7b7">✓ No differences</pre>'; return; }
                     const html = changes.slice(0, 100).map(c => {
-                        if (c.type === 'added') return `<div class="xhrl-diff-added">+ ${esc(c.path)}: ${esc(JSON.stringify(c.to))}</div>`;
-                        if (c.type === 'removed') return `<div class="xhrl-diff-removed">- ${esc(c.path)}: ${esc(JSON.stringify(c.from))}</div>`;
-                        return `<div class="xhrl-diff-changed">~ ${esc(c.path)}: ${esc(JSON.stringify(c.from))} → ${esc(JSON.stringify(c.to))}</div>`;
+                        if (c.type === 'added') return `<div class="diff-added">+ ${esc(c.path)}: ${esc(JSON.stringify(c.to))}</div>`;
+                        if (c.type === 'removed') return `<div class="diff-removed">- ${esc(c.path)}: ${esc(JSON.stringify(c.from))}</div>`;
+                        return `<div class="diff-changed">~ ${esc(c.path)}: ${esc(JSON.stringify(c.from))} → ${esc(JSON.stringify(c.to))}</div>`;
                     }).join('');
                     out.innerHTML = `<h4>Diff (${changes.length} change${changes.length !== 1 ? 's' : ''})</h4><pre>${html}</pre>`;
                 } catch (e) { toast('Diff failed: ' + e.message, '#ef4444'); }
@@ -1160,14 +1202,12 @@
         }
     };
 
-    const updateDiag = () => {
-        const diagEl = document.getElementById('xhrl-diag');
+    function updateDiag() {
+        const diagEl = $('diag');
         if (!diagEl) return;
 
-        // Auto-clean live countdown → time until next bulk sweep
         let autoText = '';
         if (CONFIG.AUTO_CLEAR_MS > 0 && state.autoClearNext) {
-            const ttl = CONFIG.AUTO_CLEAR_MS / 1000;
             const remaining = Math.max(0, Math.ceil((state.autoClearNext - Date.now()) / 1000));
             const color = remaining < 10 ? '#f87171' : '#fcd34d';
             autoText = ` · 🧹<span style="color:${color}">AUTO sweep in ${remaining}s</span>`;
@@ -1177,66 +1217,14 @@
             <span>TekMonts | ${isFirefox ? '🦊 Firefox' : '🌐 Chrome'} · ${state.hookMethod} · ${state.hookOK ? '✓' : '✗'} · ${state.store.length}/${CONFIG.MAX_LOGS} logs${state.paused ? ' · ⏸️ PAUSED' : ''}${state.skipBody ? ' · NO-BODY' : ''}${autoText}</span>
             <span>API: <code style="color:#a5b4fc">__XHR_LOGGER__</code></span>
         `;
-        diagEl.className = state.hookOK ? 'xhrl-diag' : 'xhrl-diag err';
-    };
+        diagEl.className = state.hookOK ? 'diag' : 'diag err';
+    }
 
-    /* =========================================================
-     * 🖱 EVENT HANDLING
-     * ========================================================= */
-    document.addEventListener('click', (e) => {
-        const t = e.target;
-        if (!t) return;
-        if (t === fab || (fab && fab.contains(t))) {
-            panel.classList.toggle('open');
-            renderList(); renderDetail(); updateDiag();
-            return;
-        }
-        if (!t.id) return;
-        switch (t.id) {
-            case 'xhrl-close': panel.classList.remove('open'); break;
-            case 'xhrl-clear':
-                state.store.length = 0; state.selectedId = null; state.baselineId = null;
-                updateBadge(); renderList(); renderDetail(); updateDiag();
-                break;
-            case 'xhrl-pause':
-                state.paused ? api.resume() : api.pause();
-                updateStatusUI(); renderList(); updateDiag();
-                break;
-            case 'xhrl-skipbody':
-                state.skipBody = !state.skipBody;
-                updateStatusUI(); updateDiag();
-                toast('Skip body: ' + (state.skipBody ? 'ON' : 'OFF'));
-                break;
-            case 'xhrl-group':
-                state.groupByDomain = !state.groupByDomain;
-                updateStatusUI(); renderList();
-                break;
-            case 'xhrl-autoclean': {
-                const newMs = CONFIG.AUTO_CLEAR_MS > 0 ? 0 : 60000;
-                setAutoClear(newMs);
-                updateStatusUI(); updateDiag();
-                toast(newMs ? '🧹 Auto-clean ON (60s)' : '🧹 Auto-clean OFF');
-                break;
-            }
-            case 'xhrl-export-json': download('xhr-log.json', JSON.stringify(state.store, null, 2), 'application/json'); break;
-            case 'xhrl-export-curl': download('xhr-log.sh', state.store.map(toCurl).join('\n\n'), 'text/plain'); break;
-            case 'xhrl-export-text': download('xhr-log.txt', state.store.map(toText).join('\n\n'), 'text/plain'); break;
-        }
-    });
-
-    document.addEventListener('input', (e) => {
-        if (e.target && e.target.id === 'xhrl-search') {
-            state.filter = e.target.value.toLowerCase();
-            renderList();
-        }
-    });
-
-    // Periodic diag refresh
     setInterval(updateDiag, 1000);
     setTimeout(() => { scheduleRender(); updateDiag(); }, 300);
 
     console.log(
-        '%c[XHR Logger v2.0] %cAPI ready: %c__XHR_LOGGER__.{pause, resume, clear, logs, replay, diff, setSkipBody, setMaxLogs, setAutoClear}',
+        '%c[XHR Logger v2.1] %cShadow DOM isolated. API: %c__XHR_LOGGER__',
         'color:#a5b4fc;font-weight:700', 'color:#64748b', 'color:#6ee7b7;font-family:monospace'
     );
 })();
