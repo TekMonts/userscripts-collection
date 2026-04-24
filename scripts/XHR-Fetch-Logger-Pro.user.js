@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         XHR/Fetch/WS Logger Pro
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.2.0
 // @description  XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. Shadow DOM isolated. CSP-proof. Firefox + Chrome.
 // @author       TekMonts
 // @match        *://*/*
@@ -15,6 +15,41 @@
 
 (function () {
     'use strict';
+
+    /* =========================================================
+     * 🛡 EARLY BAILOUT: Cloudflare challenge / bot-check pages
+     *    Detect and bail out RIGHT BEFORE install hook.
+     * ========================================================= */
+    const isCloudflareChallenge = () => {
+        try {
+            const h = location.hostname;
+            // CF-owned domains that serve challenges/widgets
+            if (/(^|\.)(cloudflare\.com|cloudflareinsights\.com)$/i.test(h)) return true;
+            if (h === 'challenges.cloudflare.com') return true;
+
+            // In iframe hosted by CF (Turnstile widget)
+            if (window !== window.top) {
+                try {
+                    if (/cloudflare/i.test(document.referrer)) return true;
+                } catch (_) {}
+            }
+
+            // CF interstitial pages: <title>Just a moment…</title> or meta
+            const title = (document.title || '').toLowerCase();
+            if (title.includes('just a moment') || title.includes('attention required')) return true;
+
+            // CF injects this marker on challenge pages
+            if (document.getElementById('challenge-running') ||
+                document.getElementById('cf-challenge-running') ||
+                document.querySelector('meta[http-equiv="refresh"][content*="challenge"]')) return true;
+        } catch (_) {}
+        return false;
+    };
+
+    if (isCloudflareChallenge()) {
+        console.log('[XHR Logger] Cloudflare challenge detected — skipping to avoid interference');
+        return;
+    }
 
     /* =========================================================
      * ⚙ CONFIG + STATE
@@ -44,12 +79,19 @@
         hookActivatedAt: 0,
         panelPos: null,
         panelSize: null,
+        fabPos: null,
     };
 
     try {
         state.panelPos = JSON.parse(GM_getValue('panelPos', 'null'));
         state.panelSize = JSON.parse(GM_getValue('panelSize', 'null'));
+        state.fabPos = JSON.parse(GM_getValue('fabPos', 'null'));
     } catch (_) {}
+
+    // Hoisted early — these flags can be touched by hooks/UI before the
+    // sections that declare them execute (TDZ avoidance).
+    let renderPending = false;
+    let eventsWired = false;
 
     /* =========================================================
      * 🧩 ENV DETECTION
@@ -284,6 +326,14 @@
             Object.defineProperty(proto, 'setRequestHeader', { value: newSetHeader, writable: true, configurable: true });
             Object.defineProperty(proto, 'send', { value: newSend, writable: true, configurable: true });
         }
+
+        // Stealth: make hooked XHR methods look native to fingerprint checks
+        try {
+            newOpen.toString = exportFn(() => origOpen.toString());
+            newSetHeader.toString = exportFn(() => origSetHeader.toString());
+            newSend.toString = exportFn(() => origSend.toString());
+        } catch (_) {}
+
         return true;
     };
 
@@ -349,6 +399,13 @@
             return promise;
         });
 
+        // Stealth: make hooked fetch look native to fingerprint checks
+        // (CF, Akamai, PerimeterX inspect Function.prototype.toString)
+        try {
+            const nativeStr = origFetch.toString();
+            newFetch.toString = exportFn(() => nativeStr);
+        } catch (_) {}
+
         try {
             W.fetch = newFetch;
         } catch (_) {
@@ -365,6 +422,12 @@
     const installWSHook = () => {
         const OrigWS = W.WebSocket;
         if (!OrigWS) return false;
+
+        // Bail if we can't safely wrap (e.g. Object.freeze'd)
+        try {
+            const desc = Object.getOwnPropertyDescriptor(W, 'WebSocket');
+            if (desc && desc.configurable === false && desc.writable === false) return false;
+        } catch (_) { return false; }
 
         const proto = OrigWS.prototype;
         const origSend = proto.send;
@@ -421,7 +484,12 @@
             return ws;
         }
 
+        // Make HookedWS appear as native WebSocket to anti-bot checks
         HookedWS.prototype = OrigWS.prototype;
+        try {
+            Object.defineProperty(HookedWS, 'name', { value: 'WebSocket', configurable: true });
+            HookedWS.toString = () => OrigWS.toString();
+        } catch (_) {}
         try {
             ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => {
                 if (k in OrigWS) HookedWS[k] = OrigWS[k];
@@ -664,9 +732,8 @@
             display: flex; align-items: center; justify-content: center;
             cursor: pointer; box-shadow: 0 6px 20px rgba(99,102,241,.5);
             font-weight: 700; font-size: 18px; user-select: none;
-            transition: transform .2s; pointer-events: auto;
+            transition: background .2s; pointer-events: auto; touch-action: none;
         }
-        #fab:hover { transform: scale(1.08); }
         #fab.paused { background: linear-gradient(135deg,#ef4444,#f97316); }
         #fab .badge {
             position: absolute; top: -4px; right: -4px; background: #ef4444;
@@ -680,13 +747,25 @@
             border: 1px solid #334155; border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0,0,0,.6);
             display: none; flex-direction: column; overflow: hidden;
-            min-width: 500px; min-height: 300px; pointer-events: auto;
+            min-width: 280px; min-height: 300px; pointer-events: auto;
+        }
+        @media (max-width: 600px) {
+            #panel {
+                width: 100vw !important; max-width: 100vw !important;
+                height: 90vh !important; max-height: 90vh !important;
+                left: 0 !important; right: 0 !important;
+                bottom: 0 !important; top: auto !important;
+                border-radius: 12px 12px 0 0;
+            }
+            .body { flex-direction: column !important; }
+            .list { width: 100% !important; max-height: 40% !important; border-right: none !important; border-bottom: 1px solid #334155; }
+            .resize { display: none !important; }
         }
         #panel.open { display: flex; }
         .header {
             display: flex; align-items: center; gap: 6px; padding: 8px 10px;
             background: #1e293b; border-bottom: 1px solid #334155; flex-wrap: wrap;
-            cursor: move; user-select: none;
+            cursor: move; user-select: none; touch-action: none;
         }
         .header .title { font-weight: 700; color: #a5b4fc; flex: 1; font-size: 12px; }
         .header .title .ver { color: #64748b; font-weight: 400; font-size: 10px; margin-left: 4px; }
@@ -763,7 +842,8 @@
         .frame .t { color: #64748b; font-size: 10px; margin-right: 6px; }
         .resize {
             position: absolute; right: 0; bottom: 0; width: 14px; height: 14px;
-            cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, #475569 50%);
+            cursor: nwse-resize; background: linear-gradient(135deg, transparent 45%, #475569 45%, #475569 65%, transparent 65%, transparent 75%, #475569 75%);
+            touch-action: none;
         }
         .diff-added { color: #6ee7b7; }
         .diff-removed { color: #fca5a5; text-decoration: line-through; }
@@ -797,7 +877,7 @@
     panel.id = 'panel';
     panel.innerHTML = `
         <div class="header" id="drag-handle">
-            <span class="title">🕸 XHR Logger<span class="ver">v2.1</span></span>
+            <span class="title">🕸 XHR Logger<span class="ver">v2.2</span></span>
             <input class="search" id="search" placeholder="filter..." />
             <button class="btn" id="pause" title="Pause/Resume">⏸️</button>
             <button class="btn" id="skipbody" title="Skip body">Skip Body</button>
@@ -830,6 +910,11 @@
             panel.style.width = state.panelSize.width + 'px';
             panel.style.height = state.panelSize.height + 'px';
         }
+        if (state.fabPos) {
+            fab.style.left = state.fabPos.left + 'px';
+            fab.style.top = state.fabPos.top + 'px';
+            fab.style.right = 'auto'; fab.style.bottom = 'auto';
+        }
     }
 
     function mount() {
@@ -848,22 +933,85 @@
     /* =========================================================
      * 🎯 DRAG + RESIZE + EVENT WIRING
      * ========================================================= */
-    let eventsWired = false;
     function wireEvents() {
         if (eventsWired) return;
         eventsWired = true;
 
+        // FAB: tap to toggle, drag to reposition (uses click-vs-drag detection)
+        const setupFabDrag = () => {
+            const persistFab = (left, top) => {
+                state.fabPos = { left, top };
+                try { GM_setValue('fabPos', JSON.stringify(state.fabPos)); } catch (_) {}
+            };
+            const startFabDrag = (clientX, clientY) => {
+                const r = fab.getBoundingClientRect();
+                const offX = clientX - r.left, offY = clientY - r.top;
+                let moved = false;
+                const moveTo = (cx, cy) => {
+                    const dx = Math.abs(cx - clientX), dy = Math.abs(cy - clientY);
+                    if (!moved && (dx > 6 || dy > 6)) moved = true;
+                    if (moved) {
+                        const nx = Math.max(0, Math.min(window.innerWidth - 48, cx - offX));
+                        const ny = Math.max(0, Math.min(window.innerHeight - 48, cy - offY));
+                        fab.style.left = nx + 'px';
+                        fab.style.top = ny + 'px';
+                        fab.style.right = 'auto'; fab.style.bottom = 'auto';
+                    }
+                };
+                const finish = () => {
+                    if (moved) {
+                        const r2 = fab.getBoundingClientRect();
+                        persistFab(r2.left, r2.top);
+                    } else {
+                        // It was a tap → toggle panel
+                        panel.classList.toggle('open');
+                        renderList(); renderDetail(); updateDiag();
+                    }
+                };
+                return { moveTo, finish };
+            };
+
+            fab.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const { moveTo, finish } = startFabDrag(e.clientX, e.clientY);
+                const move = (ev) => moveTo(ev.clientX, ev.clientY);
+                const up = () => {
+                    document.removeEventListener('mousemove', move);
+                    document.removeEventListener('mouseup', up);
+                    finish();
+                };
+                document.addEventListener('mousemove', move);
+                document.addEventListener('mouseup', up);
+            });
+
+            fab.addEventListener('touchstart', (e) => {
+                if (e.touches.length !== 1) return;
+                const t0 = e.touches[0];
+                e.preventDefault();
+                const { moveTo, finish } = startFabDrag(t0.clientX, t0.clientY);
+                const move = (ev) => {
+                    if (ev.touches.length !== 1) return;
+                    ev.preventDefault();
+                    moveTo(ev.touches[0].clientX, ev.touches[0].clientY);
+                };
+                const end = () => {
+                    document.removeEventListener('touchmove', move);
+                    document.removeEventListener('touchend', end);
+                    document.removeEventListener('touchcancel', end);
+                    finish();
+                };
+                document.addEventListener('touchmove', move, { passive: false });
+                document.addEventListener('touchend', end);
+                document.addEventListener('touchcancel', end);
+            }, { passive: false });
+        };
+        setupFabDrag();
+
         // Click delegation - listen on shadow so e.target is the actual inner element
+        // Note: FAB tap is handled inside setupFabDrag (not here) to disambiguate from drag
         shadow.addEventListener('click', (e) => {
             const t = e.target;
-            if (!t) return;
-
-            // FAB toggles panel
-            if (t === fab || fab.contains(t)) {
-                panel.classList.toggle('open');
-                renderList(); renderDetail(); updateDiag();
-                return;
-            }
+            if (!t || t === fab || fab.contains(t)) return;
 
             if (!t.id) return;
             switch (t.id) {
@@ -905,74 +1053,136 @@
             }
         });
 
-        // Drag
+        // Drag (mouse + touch)
         const handle = $('drag-handle');
         if (handle) {
-            handle.addEventListener('mousedown', (e) => {
-                if (e.target.closest('button,input')) return;
-                const sx = e.clientX, sy = e.clientY;
+            const startDrag = (clientX, clientY) => {
                 const r = panel.getBoundingClientRect();
                 const ix = r.left, iy = r.top;
-                e.preventDefault();
-                const move = (ev) => {
-                    let nx = ix + ev.clientX - sx;
-                    let ny = iy + ev.clientY - sy;
+                const moveTo = (cx, cy) => {
+                    let nx = ix + cx - clientX;
+                    let ny = iy + cy - clientY;
                     nx = Math.max(0, Math.min(window.innerWidth - 50, nx));
                     ny = Math.max(0, Math.min(window.innerHeight - 30, ny));
                     panel.style.left = nx + 'px';
                     panel.style.top = ny + 'px';
                     panel.style.right = 'auto'; panel.style.bottom = 'auto';
                 };
-                const up = () => {
-                    document.removeEventListener('mousemove', move);
-                    document.removeEventListener('mouseup', up);
+                const persist = () => {
                     const r2 = panel.getBoundingClientRect();
                     state.panelPos = { left: r2.left, top: r2.top };
                     try { GM_setValue('panelPos', JSON.stringify(state.panelPos)); } catch (_) {}
                 };
-                document.addEventListener('mousemove', move);
-                document.addEventListener('mouseup', up);
-            });
-        }
+                return { moveTo, persist };
+            };
 
-        // Resize
-        const resize = $('resize');
-        if (resize) {
-            resize.addEventListener('mousedown', (e) => {
-                const sx = e.clientX, sy = e.clientY;
-                const r = panel.getBoundingClientRect();
-                const iw = r.width, ih = r.height;
-                e.preventDefault(); e.stopPropagation();
-                const move = (ev) => {
-                    panel.style.width = Math.max(500, iw + ev.clientX - sx) + 'px';
-                    panel.style.height = Math.max(300, ih + ev.clientY - sy) + 'px';
-                };
+            handle.addEventListener('mousedown', (e) => {
+                if (e.target.closest('button,input')) return;
+                e.preventDefault();
+                const { moveTo, persist } = startDrag(e.clientX, e.clientY);
+                const move = (ev) => moveTo(ev.clientX, ev.clientY);
                 const up = () => {
                     document.removeEventListener('mousemove', move);
                     document.removeEventListener('mouseup', up);
+                    persist();
+                };
+                document.addEventListener('mousemove', move);
+                document.addEventListener('mouseup', up);
+            });
+
+            handle.addEventListener('touchstart', (e) => {
+                if (e.target.closest('button,input')) return;
+                if (e.touches.length !== 1) return;
+                const t0 = e.touches[0];
+                e.preventDefault();
+                const { moveTo, persist } = startDrag(t0.clientX, t0.clientY);
+                const move = (ev) => {
+                    if (ev.touches.length !== 1) return;
+                    ev.preventDefault();
+                    moveTo(ev.touches[0].clientX, ev.touches[0].clientY);
+                };
+                const end = () => {
+                    document.removeEventListener('touchmove', move);
+                    document.removeEventListener('touchend', end);
+                    document.removeEventListener('touchcancel', end);
+                    persist();
+                };
+                document.addEventListener('touchmove', move, { passive: false });
+                document.addEventListener('touchend', end);
+                document.addEventListener('touchcancel', end);
+            }, { passive: false });
+        }
+
+        // Resize (mouse + touch)
+        const resize = $('resize');
+        if (resize) {
+            const startResize = (clientX, clientY) => {
+                const r = panel.getBoundingClientRect();
+                const iw = r.width, ih = r.height;
+                const sizeTo = (cx, cy) => {
+                    panel.style.width = Math.max(280, iw + cx - clientX) + 'px';
+                    panel.style.height = Math.max(300, ih + cy - clientY) + 'px';
+                };
+                const persist = () => {
                     const r2 = panel.getBoundingClientRect();
                     state.panelSize = { width: r2.width, height: r2.height };
                     try { GM_setValue('panelSize', JSON.stringify(state.panelSize)); } catch (_) {}
                 };
+                return { sizeTo, persist };
+            };
+
+            resize.addEventListener('mousedown', (e) => {
+                e.preventDefault(); e.stopPropagation();
+                const { sizeTo, persist } = startResize(e.clientX, e.clientY);
+                const move = (ev) => sizeTo(ev.clientX, ev.clientY);
+                const up = () => {
+                    document.removeEventListener('mousemove', move);
+                    document.removeEventListener('mouseup', up);
+                    persist();
+                };
                 document.addEventListener('mousemove', move);
                 document.addEventListener('mouseup', up);
             });
+
+            resize.addEventListener('touchstart', (e) => {
+                if (e.touches.length !== 1) return;
+                const t0 = e.touches[0];
+                e.preventDefault(); e.stopPropagation();
+                const { sizeTo, persist } = startResize(t0.clientX, t0.clientY);
+                const move = (ev) => {
+                    if (ev.touches.length !== 1) return;
+                    ev.preventDefault();
+                    sizeTo(ev.touches[0].clientX, ev.touches[0].clientY);
+                };
+                const end = () => {
+                    document.removeEventListener('touchmove', move);
+                    document.removeEventListener('touchend', end);
+                    document.removeEventListener('touchcancel', end);
+                    persist();
+                };
+                document.addEventListener('touchmove', move, { passive: false });
+                document.addEventListener('touchend', end);
+                document.addEventListener('touchcancel', end);
+            }, { passive: false });
         }
     }
 
     /* =========================================================
      * 🖼 RENDER
      * ========================================================= */
-    let renderPending = false;
 
     function scheduleRender() {
         if (renderPending) return;
         renderPending = true;
         requestAnimationFrame(() => {
             renderPending = false;
-            updateBadge();
-            updateStatusUI();
-            if (panel.classList.contains('open')) renderList();
+            try {
+                updateBadge();
+                updateStatusUI();
+                if (panel.classList.contains('open')) renderList();
+            } catch (_) {
+                // UI not fully mounted yet — safe to skip this frame
+            }
         });
     }
 
@@ -1224,7 +1434,7 @@
     setTimeout(() => { scheduleRender(); updateDiag(); }, 300);
 
     console.log(
-        '%c[XHR Logger v2.1] %cShadow DOM isolated. API: %c__XHR_LOGGER__',
+        '%c[XHR Logger v2.2 %cShadow DOM isolated. API: %c__XHR_LOGGER__',
         'color:#a5b4fc;font-weight:700', 'color:#64748b', 'color:#6ee7b7;font-family:monospace'
     );
 })();
