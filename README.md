@@ -35,7 +35,7 @@ Intercept and log all network requests made via `XMLHttpRequest` and `fetch`.
 
 | Script | Description | Version | Install |
 |--------|------------|--------|--------|
-| XHR/Fetch/WS Logger Pro | XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. CSP-proof. Firefox + Chrome. | 2.0.0 | [Install](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js) |
+| XHR/Fetch/WS Logger Pro | XHR + Fetch + WebSocket logger with replay, diff, sensitive detection. Shadow DOM isolated. CSP-proof. Firefox + Chrome. | 2.1.0 | [Install](https://raw.githubusercontent.com/TekMonts/userscripts-collection/main/scripts/XHR-Fetch-Logger-Pro.user.js) |
 
 <!-- SCRIPTS_TABLE_END -->
 *(More scripts coming soon…)*
